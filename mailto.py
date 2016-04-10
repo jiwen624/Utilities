@@ -20,9 +20,9 @@ def format_header(s):
 def sendmail(parms):
     #Hard-coded parameters
     password = getpass.getpass()
-    smtp_server = 'delivery.mygridway.net' #TODO
-    from_addr = 'eyang@diablo-technologies.com'
-    cc = 'eyang@diablo-technologies.com'
+    smtp_server = 'smtp.example.com' #TODO
+    from_addr = 'sender@example.com'
+    cc = 'cc@example.com'
     smtp_port = 587
 
     from_str = parms['from']
@@ -84,7 +84,6 @@ if __name__ == '__main__':
 
     parms = {
         'from': 'Eric Yang',
-        #'to': 'mamer@diablo-technologies.com',
         'to': to,
         'subject': subject,
         'text': 'Please see attached files.',
