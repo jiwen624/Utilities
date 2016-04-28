@@ -108,9 +108,11 @@ def main():
     parser.add_argument("-P", help="the smtp port", metavar='', default='25')
     parser.add_argument("-s", help="the subject of the email", metavar='')
     parser.add_argument("-a", help="the file(s) to be attached, separated by spaces", metavar='', nargs='*')
-    parser.add_argument("-b", help="message body reading from a file or standard input: - ",
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-b", help="message body reading from a file or standard input: - ",
                         type=argparse.FileType('r'), metavar='')
-    parser.add_argument("-B", help="message body by a string", metavar='')
+    group.add_argument("-B", help="message body by a string", metavar='')
 
     parser.add_argument("-v", help="detailed print", action='store_true')
 
@@ -130,8 +132,11 @@ def main():
         else:
             pass
 
-    body = args.B if args.B else ''
-    body += args.b.read() if args.b else ''
+    body = ''
+    if args.B:
+        body = args.B
+    elif args.b:
+        body += args.b.read()
 
     sender = args.sender
 
