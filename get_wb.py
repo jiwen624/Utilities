@@ -16,12 +16,14 @@ import sys
 from PIL import Image
 from urllib.parse import quote_plus
 
+log = logging.getLogger(__name__)
 
-# TODO: get container id from weibo pages.
+# TODO: 0. 给自己的账号, 爬另一个人的weibo.
 # TODO: 1. 登陆前后多打印写信息(等待时间太长)
 # TODO: 2. 可否输完验证码回车后自动把图片文件关闭?(或者预览的方式显示?)
 # TODO: 3. 每个page的间隔时间设置成2-10s的随机数
-# TODO: 4. 格式化打印(simple)
+# TODO: 4. 格式化打印(simple) (pandas? 好像不太好搞.
+# TODO: 5. 下载微博图片以及转发的微博的图片(有可能不止一张!)
 # TODO: use requests.json() to replace json module?
 # TODO: raise its own exception?
 
@@ -31,7 +33,8 @@ class WeiboX:
     - comments
     - pictures (TODO)
     """
-    def __init__(self, account, cid, directory='.', interval=2, retries=3, to_format='simple'):
+
+    def __init__(self, account, cid=0, directory='.', interval=2, retries=3, to_format='simple', first_n=99999):
         """
         The init function.
         :param account: The weibo account name
@@ -62,7 +65,7 @@ class WeiboX:
             self.index_url = "https://passport.weibo.cn/signin/login"
             self.sess.get(self.index_url, headers=self.headers)
         except requests.exceptions.RequestException as e:
-            logging.error('Network failure({}): {}'.format(self.index_url, e))
+            log.error('Network failure({}): {}'.format(self.index_url, e))
             raise
 
         self.dir_str = directory
@@ -70,48 +73,44 @@ class WeiboX:
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            logging.error('Failed to create directory: {}: {}'.format(directory, e))
+            log.error('Failed to create directory: {}: {}'.format(directory, e))
             raise
 
         self.weibo = []
 
         # password = getpass.getpass('Password')
-        # container_id = input('Your container id :(')
-        # self.username = 'grantte@gmail.com'
+
         self.account = account
 
         self.password = '821030'
-        self.container_id = cid
+        self.container_id = cid  # cid = '100505' + uid
         # self.container_id = container_id
 
         self.interval = interval
         self.max_retries = retries
         self.to_format = to_format
+        self.first_n = first_n
 
-    @staticmethod
-    def get_su(username):
+    def get_su(self):
         """
         This function is to build the 'su' required by weibo requests.
-        :param username:
         :return:
         """
-        username_quote = quote_plus(username)
+        username_quote = quote_plus(self.account)
         username_base64 = base64.b64encode(username_quote.encode("utf-8"))
         return username_base64.decode("utf-8")
 
-    def prelogin(self, account):
+    def pre_login(self):
         """
         Redirects before successfully login.
-        :param account: account name
         :return:
         """
         call_back = "jsonpcallback" \
-                    + str(int(time.time() * 1000)
-                          + math.floor(random.random() * 100000))
+                    + str(int(time.time() * 1000) + math.floor(random.random() * 100000))
         params = {
             "checkpin": "1",
             "entry": "mweibo",
-            "su": self.get_su(account),
+            "su": self.get_su(),
             "callback": call_back
         }
 
@@ -119,17 +118,18 @@ class WeiboX:
         self.headers["Host"] = "login.sina.com.cn"
         self.headers["Referer"] = self.index_url
 
+        log.info('Start prelogin to fetch the captcha.')
         try:
             pre = self.sess.get(pre_url, params=params, headers=self.headers)
         except requests.exceptions.RequestException as e:
-            logging.error('Network failure({}): {}'.format(pre_url, e))
+            log.error('Network failure({}): {}'.format(pre_url, e))
             raise
 
         pa = r'\((.*?)\)'
 
         res = re.findall(pa, pre.text)
         if not res:
-            logging.error("Please check the network or your username.")
+            log.error("Please check the network or your username.")
         else:
             js = json.loads(res[0])
             if js["showpin"] == 1:
@@ -139,7 +139,7 @@ class WeiboX:
                 try:
                     capt = self.sess.get(captcha_url, headers=self.headers)
                 except requests.exceptions.RequestException as e:
-                    logging.error('Network failure({}): {}'.format(captcha_url, e))
+                    log.error('Network failure({}): {}'.format(captcha_url, e))
                     raise
 
                 capt_json = capt.json()
@@ -157,17 +157,15 @@ class WeiboX:
             else:
                 return ""
 
-    def login(self, username, password, pincode):
+    def login(self, pincode):
         """
         The method to login weibo.
-        :param username:
-        :param password:
         :param pincode:
         :return:
         """
         post_data = {
-            'username': username,
-            'password': password,
+            'username': self.account,
+            'password': self.password,
             'savestate': '1',
             'ec': '0',
             'pagerefer': '',
@@ -194,41 +192,53 @@ class WeiboX:
         post_url = "https://passport.weibo.cn/sso/login"
 
         try:
+            log.info('Sending login request.')
             login = self.sess.post(post_url, data=post_data, headers=self.headers)
         except requests.exceptions.RequestException as e:
-            logging.error('Network failure: {}'.format(e))
-            raise
+            log.error('Failed to login: {}'.format(e))
+            return
 
-        logging.debug('Cookies: ', login.cookies)
-        logging.debug('LoginStatusCode:{}'.format(login.status_code))
+        log.debug('Cookies: ', login.cookies)
+        log.info('LoginStatusCode: {}'.format(login.status_code))
 
+        if login.status_code != '200':
+            pass  # TODO: We should raise an exception here.
         js = login.json()
-        logging.debug('js: {}'.format(js))
+        try:
+            uid = js["data"]["uid"]
+            log.info('Found uid={}'.format(uid))
 
-        uid = js["data"]["uid"]
-        crossdomain = js["data"]["crossdomainlist"]
-        cn = "https:" + crossdomain["sina.com.cn"]
+            # containerid = '100505' + uid
+            self.container_id = '100505{}'.format(uid)
+
+            cross_domain = js["data"]["crossdomainlist"]
+            cn = "https:" + cross_domain["sina.com.cn"]
+        except KeyError as e:
+            log.error('{}'.format(e))
+            log.debug('LoginRsp: {}'.format(login.text))
+            log.error('LoginjsJson: {}'.format(js))
+            return  # TODO: or raise?
 
         self.headers["Host"] = "login.sina.com.cn"
 
         try:
             self.sess.get(cn, headers=self.headers)
         except requests.exceptions.RequestException as e:
-            logging.error('Network failure({}): {}'.format(cn, e))
+            log.error('Network failure({}): {}'.format(cn, e))
             raise
 
         self.headers["Host"] = "weibo.cn"
         try:
             ht = self.sess.get("http://weibo.cn/{}/info".format(uid, headers=self.headers))
         except requests.exceptions.RequestException as e:
-            logging.error('Network failure: {}'.format(e))
+            log.error('Network failure: {}'.format(e))
             raise
 
-        logging.debug('ht.url: {}'.format(ht.url))
-        logging.debug('Session.cookies: {}'.format(self.sess.cookies))
+        log.debug('ht.url: {}'.format(ht.url))
+        log.debug('Session.cookies: {}'.format(self.sess.cookies))
 
-        display_name = re.findall(r'<title>(.*?)</title>', ht.text)
-        logging.info('Hi {}, you have successfully logged in!'.format(display_name))
+        display_name = re.findall(r'<title>(.*?)</title>', ht.text)[0]
+        log.info('Got {}, which means you\'ve successfully logged in!'.format(display_name))
 
         return
 
@@ -246,7 +256,7 @@ class WeiboX:
         :return: the dict that contains comments elements.
         """
         if not comments_json:
-            logging.error('Comment parser invoked but no comments found.')
+            log.error('Comment parser invoked but no comments found.')
             return None
 
         comments = []
@@ -270,14 +280,14 @@ class WeiboX:
         :return:
         """
         if not page_json:
-            logging.error('Page parser invoked but no weibo items found.')
+            log.error('Page parser invoked but no weibo items found.')
             return None
 
         weibo_list = []
 
         # Each 'card' is a weibo.
         for card in page_json['cards'][0]['card_group']:
-            logging.debug('WeiboItemJson: ', card)
+            log.debug('WeiboItemJson: ', card)
 
             # Extract weibo: text, account, time, etc.
             weibo_item = card.get('mblog')
@@ -289,18 +299,18 @@ class WeiboX:
                 weibo_id = weibo_item['id']
 
             text = self.remove_tags(card['mblog']['text'])
-            logging.debug('NewText: {}\n'.format(text))
+            log.debug('NewText: {}\n'.format(text))
 
             created_at = card['mblog']['created_at']
             # url: http://ww3.sinaimg.cn/large/{pic_id}.jpg
             pic_ids = card['mblog']['pic_ids']
-            comments_num = card['mblog']['comments_count']
+            comments_count = card['mblog']['comments_count']
             source = card['mblog']['source']
             screen_name = card['mblog']['user']['screen_name']
 
             # Extract the weibo which is forwarded by you.
             if card['mblog'].get('retweeted_status'):
-                logging.debug('Retweeted: {}'.format(card['mblog'].get('retweeted_status')))
+                log.debug('Retweeted: {}'.format(card['mblog'].get('retweeted_status')))
 
                 txt = self.remove_tags(card['mblog']['retweeted_status']['text'])
                 retweet_item = {
@@ -322,22 +332,22 @@ class WeiboX:
                 cmt_num = 0
                 cmt_page = 1
 
-                with open('{}/{}_{}_comment.json'.format(self.dir_str, uid, mblog_id), 'w') as cmt_f:
+                with open('{}/{}_{}_comment.json'.format(self.dir_str, uid, mblog_id), 'w') as cmt_file:
                     while cmt_num < card['mblog']['comments_count']:
                         # url:http://m.weibo.cn/1736347302/3517371904252336/rcMod?format=cards&type=comment&hot=1
                         comment_url = 'http://m.weibo.cn/{}/{}/rcMod?format=cards&type=comment&hot=0&page={}' \
                             .format(uid, mblog_id, cmt_page)
-                        logging.debug('CommentNum: {} CommentURL: {}'
-                                      .format(card['mblog']['comments_count'], comment_url))
+                        log.debug('CommentNum: {} CommentURL: {}'
+                                  .format(card['mblog']['comments_count'], comment_url))
                         try:
-                            cmt_r = self.sess.get(comment_url, headers=self.headers)
+                            cmt_rsp = self.sess.get(comment_url, headers=self.headers)
                         except requests.exceptions.RequestException as e:
-                            logging.error('Network failure({}): {}'.format(comment_url, e))
+                            log.error('Network failure({}): {}'.format(comment_url, e))
                             raise
 
-                        cmt_r.encoding = 'utf-8'
-                        cmt_f.write(cmt_r.text)
-                        comments_json = json.loads(cmt_r.text)
+                        cmt_rsp.encoding = 'utf-8'
+                        cmt_file.write(cmt_rsp.text)
+                        comments_json = json.loads(cmt_rsp.text)
 
                         if comments_json[0]['mod_type'] == 'mod/empty':
                             break
@@ -359,7 +369,7 @@ class WeiboX:
                     'text': text,
                     'created_at': created_at,
                     'pic_ids': pic_ids,
-                    'comments_num': comments_num,
+                    'comments_count': comments_count,
                     'source': source,
                     'screen_name': screen_name,
                     'retweet_item': retweet_item,
@@ -369,27 +379,48 @@ class WeiboX:
 
         return weibo_list
 
-    # TODO: 以表格方式打印(有现成的库), comments缩进8 spaces
-    def serialize(self, to_format):
+    def serialize(self):
         """
         To store the weibo into a file: txt, csv or other formats.
+        This function will parse the following dict got from 'parse_page()':
+            {
+                'weibo_id': weibo_id,
+                'text': text,
+                'created_at': created_at,
+                'pic_ids': pic_ids,
+                'comments_count': comments_count,
+                'source': source,
+                'screen_name': screen_name,
+                'retweet_item': retweet_item,
+                'comments': comments
+            }
+
         :param :
         :return:
         """
         if not len(self.weibo):
-            logging.error('Serialization invoked but no weibo entries found!')
+            log.error('Serialization invoked but no weibo entries found!')
             return
 
-        if to_format == 'simple':
+        if self.to_format == 'simple':
             with open('{}/{}.txt'.format(self.dir_str, self.weibo[0]['screen_name']), 'w') as f:
+                # Print weibo items.
                 for item in self.weibo:
-                    print('{}    {}'.format(item['created_at'], item['text']), file=f)
+                    print('@{}    Comments:({})      Post Date: {}'.format(
+                        item['screen_name'],
+                        item['comments_count'],  # Number of comments
+                        item['created_at'][2:]  # Drop the first two digits of yyyy
+                    ), file=f)
+
+                    print('{}'.format(item['text']), file=f)  # Print to a file instead of stdout
 
                     # Print comments.
-                    if item['comments_num'] != 0:
+                    if item['comments_count'] != 0:
                         for comment in item['comments']:
-                            print('    - @{}: {}'.format(comment['screen_name'], comment['text']),
+                            print('{}- @{}: {}'.format(' ' * 10, comment['screen_name'], comment['text']),
                                   file=f)
+
+                    print('', file=f)  # Leave a line between weibo items.
         else:
             pass  # TODO: other formats are currently not supported.
 
@@ -397,12 +428,16 @@ class WeiboX:
         """The main function.
         :return:
         """
-        pin_code = self.prelogin(self.account)
-        self.login(self.account, self.password, pin_code)
+        # Simulated prelogin.
+        pin_code = self.pre_login()
+
+        # And login.
+        self.login(pin_code)
 
         eop_retry = 0  # Retry times after the end of pages (Disable it)
         curr_page_idx = 1
 
+        log.info('Start fetching...')
         while True:
             self.headers['Host'] = 'm.weibo.cn'
             self.headers['Accept'] = 'application/json, text/javascript, */*; q=0.01'
@@ -413,43 +448,46 @@ class WeiboX:
             self.headers['Accept-Language'] = 'en-US,en;q=0.8,zh-CN;q=0.6,zh;q=0.4'
 
             try:
-                r = self.sess.get('http://m.weibo.cn/page/json?containerid={}_-_WEIBO_SECOND_PROFILE_WEIBO&page={}'
-                                  .format(self.container_id, curr_page_idx), headers=self.headers)
+                rsp = self.sess.get('http://m.weibo.cn/page/json?containerid={}_-_WEIBO_SECOND_PROFILE_WEIBO&page={}'
+                                    .format(self.container_id, curr_page_idx), headers=self.headers)
             except requests.exceptions.RequestException as e:
-                logging.error('Network failure: {}'.format(e))
+                log.error('Network failure: {}'.format(e))
                 raise
 
             # r.encoding = 'utf-8'
-            logging.debug('WeiboPageRsp: ', r.text)
+            log.debug('WeiboPageRsp: ', rsp.text)
 
             # It returns either an html or json string.
-            if r.text.startswith('<!doctype html>'):
-                json_str = re.findall(r'window\.\$render_data = (.*?);</script>', r.text, flags=re.S)[0]
-                logging.debug('JsonStrInWeiboRsp: {}'.format(json_str))
+            if rsp.text.startswith('<!doctype html>'):
+                json_str = re.findall(r'window\.\$render_data = (.*?);</script>', rsp.text, flags=re.S)[0]
+                log.debug('JsonStrInWeiboRsp: {}'.format(json_str))
                 page = json.loads(json_str)
             else:
-                page = json.loads(r.text)
+                page = json.loads(rsp.text)
 
             if page['cards'][0]['mod_type'] == 'mod/empty':
-                logging.info('Reaching the end? Try it again: {}'.format(eop_retry))
+                log.info('Reaching the end? Try it again: {}'.format(eop_retry))
                 eop_retry += 1
                 if eop_retry >= self.max_retries:  # Maximum retry times
                     break
             else:
                 with open('{}/{}_{}.json'.format(self.dir_str, self.account, curr_page_idx), 'w') as f:
-                    print(r.text, file=f)
-                    self.weibo.extend(self.parse_page(page))
+                    print(rsp.text, file=f)
+                    self.weibo.extend(self.parse_page(page))  # Invoke page parser here.
 
                 eop_retry = 0  # Reset retry times
 
-                logging.info(' - The page {} is done.'.format(curr_page_idx))
+                log.info(' - The page {} is done.'.format(curr_page_idx))
                 curr_page_idx += 1
+                if curr_page_idx > self.first_n:
+                    log.info('Reaching the upper limit of {} pages. Bye.'.format(self.first_n))
+                    break
 
             time.sleep(self.interval)
 
-        self.serialize(self.to_format)
+        self.serialize()
 
-        logging.info('-Done-')
+        log.info('-That\'s it-')
 
 
 def main():
@@ -457,12 +495,12 @@ def main():
     """
     parser = argparse.ArgumentParser(description="The Utility to backup your weibo :P")
     parser.add_argument("name", help="your weibo account name")
-    #parser.add_argument("-c", help="your weibo container id")
-    parser.add_argument("cid", help="your weibo container id")
 
     parser.add_argument("-v", help="detailed print( -v: info, -vv: debug)",
                         action='count', default=0)
     parser.add_argument("-d", help="the directory to store your data")
+    parser.add_argument("-n", help="Fetch the first n pages.", type=int, default=99999)
+
     parser.add_argument("-f", help="which format you'd like to store your weibo:",
                         choices=['simple', 'csv', 'doc'],
                         default='simple')
@@ -476,16 +514,14 @@ def main():
     else:
         log_level = logging.DEBUG
 
-    logging.basicConfig(
-        filename='/dev/stdout',
-        level=log_level,
-        format='%(message)s'
-    )
+    # Set the log level of this module
+    logging.basicConfig(level=log_level)
+
+    # Disable the info logging level of requests module
+    logging.getLogger("requests").setLevel(logging.WARNING)
 
     username = args.name
     dir_name = args.d if args.d else username
-    # My cid = '1005051736347302'
-    cid = args.cid
 
     to_format = args.f
     # TODO: remove these lines after 'csv' and 'doc' are implemented.
@@ -493,16 +529,19 @@ def main():
         print('Oops! The option {} has not been implemented. :('.format(to_format))
         to_format = 'simple'
 
+    first_n = args.n  # Fetch the first n pages. args.n == 0 means all.
+
     # This is a sample:
     # 1. Instantiate the WeiboX class with mandatory parameters
     # 2. Call WeiboX.fetch_tweets()
     # 3. Check the files under current directory (or other specified directory)
     w = WeiboX(account=username,
-               cid=cid,
                directory=dir_name,
-               to_format=to_format)
+               to_format=to_format,
+               first_n=first_n)
 
     return w.fetch_tweets()
+
 
 # Run: ./get_weibo.py name cid -v
 if __name__ == "__main__":
