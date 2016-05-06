@@ -305,7 +305,9 @@ class WeiboX:
             if tname.status_code == 200:
                 self.target_uid = re.findall(r'100505(.*?)%', tname.cookies['M_WEIBOCN_PARAMS'])[0]
                 self.target_weibo_count = re.findall(r'"mblogNum":"(.*?)"', tname.text)[0]
-                log.info('Found target uid: {} weibo_num: {}'.format(self.target_uid, self.target_weibo_count))
+                log.info('Found target uid: {} name: {} weibo_num: {}'.format(self.target_uid,
+                                                                              self.target_screen_name,
+                                                                              self.target_weibo_count))
             else:
                 raise Exception('Failed to get target user info after login.')
 
@@ -579,7 +581,9 @@ class WeiboX:
         """
         log.info('Storing data: {} in total, {} of them fetched'.format(self.target_weibo_count, len(self.weibo)))
 
-        with open('{}/{}.txt'.format(self.dir_str, self.weibo[0]['screen_name']), 'w') as f:
+        weibo_file_name = '{}/{}.txt'.format(self.dir_str, self.weibo[0]['screen_name'])
+
+        with open(weibo_file_name, 'w') as f:
             print('截至目前, {}发了{}条微博:'.format(self.target_screen_name, self.target_weibo_count), file=f)
 
             # print every weibo item.
@@ -622,6 +626,8 @@ class WeiboX:
                 # Leave a line between weibo items.
                 print('', file=f)
 
+        log.info('Check path: {} for your weibo records.'.format(weibo_file_name))
+
     def fetch_tweets(self):
         """The main function.
         :return:
@@ -657,6 +663,8 @@ class WeiboX:
                                    .format(target_cid))
         page_headers['Accept-Encoding'] = 'gzip, deflate, sdch'
         page_headers['Accept-Language'] = 'en-US,en;q=0.8,zh-CN;q=0.6,zh;q=0.4'
+
+        # start to fetch weibo pages
         while True:
             # sleep for a while if error happened
             time.sleep(10*eop_retry)
@@ -691,9 +699,9 @@ class WeiboX:
             # Check if we've reached the end by examine the mod_type.
             try:
                 mod_type = page['cards'][0].get('mod_type')
-            except KeyError as e:  # the json returned by server may not contain 'card' or 'mod_type'
-                log.info('Invalid page: {}'.format(page.get('msg')))
-                log.warning('And the PageJson: {}'.format(page))
+            except KeyError:  # the json returned by server may not contain 'card' or 'mod_type'
+                log.warning('Request reset by server? {}'.format(page.get('msg')))
+                log.debug('And the PageJson: {}'.format(page))
                 mod_type = None
 
             # different mod_type means different action: empty->the end; pagelist->continue; others->error!
@@ -716,7 +724,7 @@ class WeiboX:
                     log.info('Exiting after reaching the maximum pages allowed: {}'.format(self.first_n))
                     break
             else:
-                log.error('I\'m confused with this mod_type: {}'.format(mod_type))
+                log.warning('Bad mod_type: {}. Try it again: {}'.format(mod_type, eop_retry))
                 eop_retry += 1
                 if eop_retry >= self.max_retries:  # Maximum retry times
                     break
@@ -725,14 +733,13 @@ class WeiboX:
             time.sleep(random.randrange(self.interval, self.interval * 5))
 
             # hardcoded, let's take a break to avoid being banned.
-            if not curr_page_idx % 20:
-                time.sleep(20)
+            if not curr_page_idx % 10:
+                time.sleep(curr_page_idx)
 
         if eop_retry == self.max_retries:
-            log.warning('Give up after {} retries, but I will store the good part for you.'.format(eop_retry))
+            log.warning('Give up after {} retries.'.format(eop_retry))
 
         self.serialize()
-
         log.info('-That\'s it-')
 
 
