@@ -8,5 +8,7 @@ ssh-keylogin.py: setup SSH key-based login for multiple hosts
 
 get_wb.py: backup your wb(tweets, comments, pictures, etc)
 
+sohu-blow-crawler.py: A crawler to backup your sohu blog.
+
 tmux.conf: A tmux config file
 
