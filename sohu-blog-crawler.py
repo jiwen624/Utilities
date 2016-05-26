@@ -14,6 +14,7 @@ from multiprocessing import Pool
 
 log = logging.getLogger(__name__)
 
+
 def fetch_ebi(url):
     """
     Access the url provided and fetch the ebi string from the HTML page
@@ -21,8 +22,8 @@ def fetch_ebi(url):
     :return: ebi
     """
     try:
-        rsp = requests.get(url)
-    except requests.exceptions.RequestException as e:
+        rsp = requests.get(url, timeout=20)
+    except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
         log.error('Failed to get ebi: network failure({}): {}'.format(url, e))
         raise
 
@@ -52,7 +53,6 @@ def blog_items(url):
     """
     This is a generator which returns a blog item when invoked.
     :param url:
-    :param ebi:
     :return:
     """
     ebi = fetch_ebi(url)
@@ -60,8 +60,8 @@ def blog_items(url):
     for page_no in range(1, 1000):
         page_url = blog_items_url(url, ebi, page_no)
         try:
-            rsp = requests.get(page_url)
-        except requests.exceptions.RequestException as e:
+            rsp = requests.get(page_url, timeout=20)
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
             log.error('(Master) Failed to get page list: ({}): {}'.format(url, e))
             raise
 
@@ -119,7 +119,7 @@ def create_html_file(title, url, date, body):
 
 def cut_url(matchobj):
     log.debug('Before: {} After: {}'.format(matchobj.group(0), matchobj.group(0).split('/')[-1]))
-    return matchobj.group(0).split('/')[-1]
+    return 'resources/' + matchobj.group(0).split('/')[-1]
 
 
 def get_blog_content(url, title, date, base_dir='.'):
@@ -140,35 +140,32 @@ def get_blog_content(url, title, date, base_dir='.'):
     log.debug('({}) Fetching blog: {} {}.'.format(pid, url, title))
 
     try:
-        rsp = requests.get(url)
-    except requests.exceptions.RequestException as e:
-        log.error('({}) Failed to get blog content: network failure({}): {}'.format(pid, url, e))
-        # raise
-
-    soup = BeautifulSoup(rsp.text, 'lxml')
+        rsp = requests.get(url, timeout=20)
+        soup = BeautifulSoup(rsp.text, 'lxml')
+    except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+        log.error('({}) Failed to get blog: network failure({}): {}'.format(pid, url, e))
+        return
 
     images = soup.find("div", {"id": "main-content"}).find_all('img')
     for img in images:
         img_url = img.get('src')
         img_file_name = img_url.split('/')[-1]
 
-        log.debug('({}) Fetching images [{}]'.format(pid, img_url))
+        log.debug('({}) Fetching image [{}]'.format(pid, img_url))
 
         try:
-            rsp = requests.get(img_url)
-        except requests.exceptions.RequestException as e:
+            img_rsp = requests.get(img_url, timeout=20)
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
             log.error('({}) Failed to get images: network failure({}): {}'.format(pid, img_url, e))
+            continue
             # raise
 
-        if rsp.status_code == 200:
-            try:
-                img_file = base_dir + '/resources/'+img_file_name
-                log.debug('({}) writing img [{}] to file {}'.format(pid, img, img_file))
+        if img_rsp.status_code == 200:
+            img_file = base_dir + '/resources/'+img_file_name
+            log.debug('({}) writing img [{}] to file {}'.format(pid, img_url, img_file))
 
-                with open(img_file, 'wb') as f:
-                    f.write(rsp.content)
-            except:  # TODO: reduce the scope
-                log.error('({}) file error: {}'.format(pid, img_file))
+            with open(img_file, 'wb') as f:
+                f.write(img_rsp.content)
         else:
             # Continue to fetch the next image/item.
             log.warning('({}) Failed to download image with url {}'.format(pid, img_url))
@@ -181,28 +178,26 @@ def get_blog_content(url, title, date, base_dir='.'):
     log.debug('({}) main content captured: {} {}'.format(pid, url, title))
 
     html = create_html_file(title, url, date, main_content)
-    log.debug('({}) content html created: {} {}'.format(pid, url, html))
+    # log.debug('({}) content html created: {} {}'.format(pid, url, html))
 
     relative_html = re.sub(r'http://.*?\.(?:jpg|gif|png)', cut_url, html)
 
-    log.debug('({}) relative_html created: {} {}'.format(pid, url, relative_html))
+    # log.debug('({}) relative_html created: {} {}'.format(pid, url, relative_html))
 
     html_file = base_dir + '/{}_{}.html'.format(date, title)
     log.debug('({}) [{}] writing to file: {}'.format(pid, url, html_file))
-    try:
-        with open(html_file, 'w') as blog_page_html:
-            blog_page_html.write(relative_html)
-    except:  # Minimize the scope
-        log.error('({}) file error: {}'.format(pid, html_file))
+
+    with open(html_file, 'w') as blog_page_html:
+        blog_page_html.write(relative_html)
 
     log.info('({}) Fetched: {}  [{}]  {}'.format(pid, date, url, title))
 
 
-# def download_blog_item(url, title, date, base_dir='.'):
-#     try:
-#         get_blog_content(url, title, date, base_dir)
-#     except:
-#         log.error('Error in get_blog_content')
+def download_blog_item(url, title, date, base_dir='.'):
+    try:
+        get_blog_content(url, title, date, base_dir)
+    except Exception as e:
+        log.error('{} Exception catched! {}'.format(os.getpid(), e))
 
 
 def main():
@@ -247,7 +242,8 @@ def main():
     try:
         pathlib.Path(args.d + '/resources').mkdir(parents=True, exist_ok=True)
     except OSError:
-        raise
+        log.error('Failed to create directory: {}'.format(args.d + '/resources'))
+        return -1
 
     log.info('Start fetching {}...'.format(url))
     p = Pool(worker_num)
@@ -256,14 +252,16 @@ def main():
     for entry_date, entry_url, entry_title in blog_items(url):
         # p.apply_async(get_blog_content, args=(entry_url, entry_title, entry_date, d))
         log.debug('(Master) Preparing to fetch: {} {}'.format(entry_url, entry_title))
-        p.apply_async(get_blog_content, args=(entry_url, entry_title, entry_date, d))
+        # p.apply_async(get_blog_content, args=(entry_url, entry_title, entry_date, d))
+        p.apply_async(download_blog_item, args=(entry_url, entry_title, entry_date, d))
+
         blog_num += 1
 
-    log.debug('All page index fetched, waiting for page downloading.')
+    log.debug('(Master) All page index fetched, waiting for page downloading.')
     p.close()
-    log.debug('Pool closed')
+    log.debug('(Master) Pool closed')
     p.join()
-    log.debug('Pool joined')
+    log.debug('(Master) Pool joined')
 
     elapsed = int(time.time() - start)
     log.info("Fetched {} blogs by {} workers in {} seconds. Bye.".format(blog_num, worker_num, elapsed))
