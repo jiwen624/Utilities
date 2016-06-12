@@ -10,5 +10,7 @@ get_wb.py: backup your wb(tweets, comments, pictures, etc)
 
 sohu-blow-crawler.py: A crawler to backup your sohu blog.
 
+sysbench_plot.py: A helper program to extract data from sysbench log and plot graphs.
+
 tmux.conf: A tmux config file
 
