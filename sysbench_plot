@@ -57,7 +57,7 @@ def plot(tps_data, plot_filename):
 
     plt.subplot(211)
     plt.plot(sec, tps)
-    plt.title('TPS', fontsize=10, fontweight='bold')
+    plt.title('TPS ({})'.format(plot_filename.split('.')[0]), fontsize=10, fontweight='bold')
     plt.ylabel('tps')
     plt.xlim([0, sec_max])
     plt.grid(True)
@@ -72,14 +72,16 @@ def plot(tps_data, plot_filename):
 
     plt.xlabel('seconds')
     plt.savefig(plot_filename)
+    plt.close()
 
 if __name__ == '__main__':
     # Get the file name from the first parameter, it's better to use argparse here.
-    logfile_name = sys.argv[1]
+    logfile_names = sys.argv[1:]
     try:
-        log_data = parse_log(logfile_name)
-        plot_file = logfile_name.split('.')[0] + '.png'
-        plot(log_data, plot_file)
+        for file_name in logfile_names:
+            log_data = parse_log(file_name)
+            plot_file = file_name.split('.')[0] + '.png'
+            plot(log_data, plot_file)
     except Exception:
         print('Error occured, see error stack above.')
         sys.exit(1)
