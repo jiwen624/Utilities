@@ -96,7 +96,7 @@ if __name__ == '__main__':
 
     logfile_names = args.files
     prefix = args.p
-    print(logfile_names, prefix)
+    # print(logfile_names, prefix)
 
     try:
         for file_name in logfile_names:
