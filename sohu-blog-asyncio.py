@@ -15,9 +15,11 @@ import argparse
 import logging
 from bs4 import BeautifulSoup
 
-log = logging.getLogger(__name__)
+# log = logging.getLogger(__name__)
+log = logging.getLogger('')
 fetched_blog_num = 0
 ebi_text = ''
+failed_url = []
 
 
 async def fetch_ebi(url):
@@ -94,7 +96,7 @@ async def blog_items(url, page_no):
                     assert resp.status == 200
                     page_text = await resp.text()
     except Exception:
-        log.error('Error fetching blog items, url: {} page: {}'.format(url, page_no))
+        log.error('Failed to get page {} of url: {}'.format(page_no, url))
         raise  # TODO: Exception handling.
 
     if 'data-entryid' not in page_text:
@@ -115,7 +117,8 @@ def blog_entry(html):
     """
     blog_entry_pattern = r'<span class="date">(.*)</span>\s*<a href="(.*)"  target="_blank" class="list-title">(.*)</a>'
     for m_obj in re.finditer(blog_entry_pattern, html):
-        log.debug('(Master) Producing blog entries {} {} {}'.format(m_obj.group(1), m_obj.group(2), m_obj.group(3)))
+        log.debug('(Master) Producing blog entries {} {} {}'
+                  .format(m_obj.group(1), m_obj.group(2), m_obj.group(3)))
         yield m_obj.group(1), m_obj.group(2), m_obj.group(3)
 
 
@@ -162,7 +165,10 @@ async def get_blog_content(url, title, date, base_dir='.'):
     :param base_dir:
     :return:
     """
-    pid = os.getpid()
+    global failed_url
+    global fetched_blog_num
+    # pid = os.getpid()
+    pid = 0
 
     log.debug('({}) Fetching blog: {} {}.'.format(pid, url, title))
 
@@ -173,7 +179,10 @@ async def get_blog_content(url, title, date, base_dir='.'):
                     assert resp.status == 200
                     blog_text = await resp.text()
     except Exception:
-        log.error('Failed to get blog content, url: {} title: {} date: {}'.format(url, title, date))
+        log.error('Failed to get blog content, url: {} title: {} date: {}'
+                  .format(url, title, date))
+        failed_url.append((date, url, title))
+        # Just raise this exception and skip the images of this page.
         raise  # TODO: Exception handling.
 
     soup = BeautifulSoup(blog_text, 'lxml')
@@ -193,7 +202,10 @@ async def get_blog_content(url, title, date, base_dir='.'):
                         assert resp.status == 200
                         img_content = await resp.read()
         except Exception:
-            log.warning('({}) Failed to download image with url {}, but I will continue.'.format(pid, img_url))
+            log.warning('({}) Failed to download image with url {}, but I will continue.'
+                        .format(pid, img_url))
+            # Skip the failed images
+            # failed_url.append(('0000-00-00', url, 'Image'))
             continue
 
         img_file = base_dir + '/resources/' + img_file_name
@@ -220,17 +232,16 @@ async def get_blog_content(url, title, date, base_dir='.'):
         blog_page_html.write(relative_html)
 
     log.info('({}) Fetched: {}  [{}]  {}'.format(pid, date, url, title))
-
-
-async def download_blog_item(url, title, date, base_dir='.'):
-    global fetched_blog_num
-
-    try:
-        await get_blog_content(url, title, date, base_dir)
-    except Exception as e:
-        log.error('{} Exception catched! {}'.format(os.getpid(), e))
-
     fetched_blog_num += 1
+
+
+async def download_blog_item(sem, url, title, date, base_dir='.'):
+    async with sem:
+        try:
+            await get_blog_content(url, title, date, base_dir)
+        except Exception as e:
+            # Don't raise the exception here, otherwise other coroutines will be stopped.
+            log.error('{} Exception catched! {}'.format(os.getpid(), e))
 
 
 def main():
@@ -238,11 +249,17 @@ def main():
     The main function
     :return:
     """
+    global failed_url
+    global fetched_blog_num
+
     parser = argparse.ArgumentParser(description="The Utility to backup your sohu blog :P")
     parser.add_argument("url", help="the url of your sohu blog")
     parser.add_argument("-v", help="detailed print( -v: info, -vv: debug)",
                         action='count', default=0)
     parser.add_argument("-d", help="the directory to store your data", default='.')
+    parser.add_argument("-n", help="the number of concurrent workers (coroutines, actually)",
+                        type=int, default=100)
+    parser.add_argument("-p", help="max pages, if you know", type=int, default=100)
 
     args = parser.parse_args()
 
@@ -266,6 +283,9 @@ def main():
     else:
         url = 'http://' + args.url
 
+    worker_num = args.n
+    max_pages = args.p
+
     d = args.d
     try:
         pathlib.Path(args.d + '/resources').mkdir(parents=True, exist_ok=True)
@@ -277,19 +297,39 @@ def main():
 
     # TODO: 待改进, 目前获取博客列表和获取每个博客内容这两部分工作还是串行的, 下一步改造成流式处理
     loop = asyncio.get_event_loop()
-    blog_list_tasks = [blog_items(url, i) for i in range(100)]
+    blog_list_tasks = [blog_items(url, i) for i in range(max_pages)]
     result = loop.run_until_complete(asyncio.gather(*blog_list_tasks))
+
     blogs = [item for sublist in result if sublist for item in sublist]
     log.debug('\n\n {} blogs: {}'.format(len(blogs), blogs))
 
-    content_tasks = [download_blog_item(entry_url, entry_title, entry_date, d)
+    # Limit the number of coroutines
+    sem = asyncio.Semaphore(worker_num)
+
+    content_tasks = [download_blog_item(sem, entry_url, entry_title, entry_date, d)
                      for entry_date, entry_url, entry_title in blogs]
 
     loop.run_until_complete(asyncio.wait(content_tasks))
+
+    # Retry the failed urls.
+    log.info('Try to get the failed urls...')
+    failed_tasks = [download_blog_item(sem, entry_url, entry_title, entry_date, d)
+                    for entry_date, entry_url, entry_title in failed_url]
+
+    failed_url = []
+
+    loop.run_until_complete(asyncio.wait(failed_tasks))
+
+    log.info('Tried my best.')
+    for entry_date, entry_url, entry_title in failed_url:
+        log.info('{}  {}  {}'.format(entry_date, entry_url, entry_title))
+
     loop.close()
 
     elapsed = int(time.time() - start)
-    log.info("Fetched {} blogs in {} seconds. Bye.".format(fetched_blog_num, elapsed))
+
+    log.info("Fetched {} blogs in {} seconds, {} others failed. Bye."
+             .format(fetched_blog_num, elapsed, len(failed_url)))
 
     return 0
 
