@@ -104,16 +104,19 @@ def create_db(basedir, dbsize, dbnum):
     log.debug('Finished to prepare the database.')
 
 
-def prepare_db(basedir, dbsize, dbnum):
+def prepare_db(basedir, dbsize, dbnum, options):
     """
     Clean the database environment and setup a new one.
     :param basedir:
     :param dbsize:
     :param dbnum:
+    :param options:
     :return:
     """
     assert dbsize is not None
     assert dbnum is not None
+    if not options:
+        options = []
 
     log.debug('Killing processes: mysqld_safe, mysqld, mysql, mysqladmin')
     kill_proc('mysqld_safe')
@@ -127,10 +130,13 @@ def prepare_db(basedir, dbsize, dbnum):
     self_pid = os.getpid()
     kill_proc(exec_file, self_pid)
 
-    log.debug('Removing database.')
-    remove_db(basedir)
-    log.debug('Creating database.')
-    create_db(basedir, dbsize, dbnum)
+    if 'skip_db_recreation' in options:
+        log.debug('Skipping database recreation.')
+    else:
+        log.debug('Removing database.')
+        remove_db(basedir)
+        log.debug('Creating database.')
+        create_db(basedir, dbsize, dbnum)
 
 
 def start_db(dbnum):
@@ -167,12 +173,15 @@ def parse_args():
                         help="parameters(no spaces before and after =): "
                              "'track_active=\"38\" mysql_innodb_buffer_pool_size=\"10240M\"' ",
                         default='')
+    parser.add_argument("-o", nargs='*', help="supported options: skip_db_recreation")
+
 
     args = parser.parse_args()
 
     sys_args = dict(item.split('=') for item in args.p.split())
 
-    return args.v, args.d, args.size, args.num, sys_args
+    log.error('*******************************options: {}'.format(args.o))
+    return args.v, args.d, args.size, args.num, sys_args, args.o
 
 
 def set_track_active(args):
@@ -190,23 +199,25 @@ def set_track_active(args):
         raise RuntimeError('Seems that the bf is not loaded.')
 
     # Set track active and mysql config file
-    track_active = args.get('track_active', 0)
+    track_active = args.get('track_active', '0')
     log.debug('Set track active to {}'.format(track_active))
-    # 0 or None means DMX should be disabled, I'll remove /dmx/etc/bfapp.d/mysqld here.
-    try:
-        os.remove('/dmx/etc/bfapp.d/mysqld')
-    except FileNotFoundError:
-        pass
 
-    if track_active:
+    if track_active != '0':
         try:
             shutil.copy2('/dmx/etc/bfapp.d/bak.mysqld', '/dmx/etc/bfapp.d/mysqld')
-        except FileNotFoundError:
+        except (FileNotFoundError, FileExistsError):
             pass
         # Set track active
         set_ta_cmd = 'memcli process settings --set-max {}'.format(track_active)
         ret = check_output(set_ta_cmd, shell=True, stderr=STDOUT)
         log.debug('Set result: {}'.format(ret.decode('utf-8').strip()))
+    else:
+        # 0 or None means DMX should be disabled, I'll remove /dmx/etc/bfapp.d/mysqld here.
+        try:
+            os.remove('/dmx/etc/bfapp.d/mysqld')
+        except FileNotFoundError:
+            pass
+        log.debug('Track active=0, bfapp.d/mysqld removed.')
 
 
 def set_mysql_cnf(args):
@@ -265,10 +276,10 @@ def trans_log_level(level_int=1):
 
 
 if __name__ == "__main__":
-    log_level, base_dir, db_size, db_num, sys_args = parse_args()
+    log_level, base_dir, db_size, db_num, sys_args, options = parse_args()
     # Set the log level of this module
     logging.basicConfig(level=trans_log_level(log_level))
 
     prepare_sys(sys_args)
-    prepare_db(base_dir, db_size, db_num)
+    prepare_db(base_dir, db_size, db_num, options)
     start_db(db_num)
