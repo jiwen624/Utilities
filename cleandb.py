@@ -51,6 +51,7 @@ def remove_db(basedir):
     """
     assert basedir is not None
 
+    log.info('Removing mysql directories under {}'.format(basedir))
     pattern = r'^mysql\d+$'
     for file in os.listdir(basedir):
         abspath = os.path.join(basedir, file)
@@ -74,7 +75,7 @@ def create_db(basedir, dbsize, dbnum):
         log.debug('Creating directory: {}'.format(abspath))
         os.mkdir(abspath)
 
-    log.debug('Untar database files for database 1-{}.'.format(dbnum))
+    log.info('Untar database files for database 1-{}.'.format(dbnum))
     untar_cmd = 'tar zxf /home/sysbench_backup_{}g.tar.gz --strip-components 1 -C {}/mysql{}'
     running_procs = [Popen(untar_cmd.format(dbsize, base_dir, i), shell=True, stdout=PIPE, stderr=PIPE)
                      for i in range(1, dbnum + 1)]
@@ -88,7 +89,7 @@ def create_db(basedir, dbsize, dbnum):
                     log.error('Untar failed: ({}) {}'.format(retcode, results.decode('utf-8')))
                     raise RuntimeError(errors)
                 else:
-                    log.debug('Untar finished: (ret={}) {}'.format(retcode, results.decode('utf-8')))
+                    log.info('Untar finished: (ret={}) {}'.format(retcode, results.decode('utf-8')))
 
                 running_procs.remove(proc)
                 break
@@ -101,7 +102,7 @@ def create_db(basedir, dbsize, dbnum):
         log.debug('Changing the owner of {} to mysql:mysql'.format(abspath))
         shutil.chown(abspath, user='mysql', group='mysql')
 
-    log.debug('Finished to prepare the database.')
+    log.info('Finished to prepare the database.')
 
 
 def prepare_db(basedir, dbsize, dbnum, options):
@@ -118,31 +119,32 @@ def prepare_db(basedir, dbsize, dbnum, options):
     if not options:
         options = []
 
-    log.debug('Killing processes: mysqld_safe, mysqld, mysql, mysqladmin')
+    log.info('Killing processes: mysqld_safe, mysqld, mysql, mysqladmin, tdctl, cleandb.py')
     kill_proc('mysqld_safe')
     kill_proc('mysqld')
     kill_proc('mysql')
     kill_proc('mysqladmin')
     kill_proc('tar')
     kill_proc('zip')
+    kill_proc('tdctl')
 
     _, exec_file = os.path.split(__file__)
     self_pid = os.getpid()
     kill_proc(exec_file, self_pid)
 
     if 'skip_db_recreation' in options:
-        log.debug('Skipping database recreation.')
+        log.info('Skipping database recreation.')
     else:
-        log.debug('Removing database.')
+        log.info('Removing database.')
         remove_db(basedir)
-        log.debug('Creating database.')
+        log.info('Creating database.')
         create_db(basedir, dbsize, dbnum)
 
 
 def start_db(dbnum):
     assert dbnum is not None
     startdb_cmd = 'mysqld_multi start {}'.format(','.join([str(x) for x in range(1, dbnum + 1)]))
-    log.debug('Starting db: {}'.format(startdb_cmd))
+    log.info('Starting db: {}'.format(startdb_cmd))
     Popen(startdb_cmd, shell=True, stdout=PIPE, stderr=STDOUT)
 
     # Check if the databases have been up and running, wait for 200*5 seconds
@@ -156,7 +158,7 @@ def start_db(dbnum):
         time.sleep(10)
 
     if len(started.split()) < dbnum:
-        raise RuntimeError('Failed to start all the databases.')
+        raise RuntimeError('Failed to start all the databases after 2000 seconds')
 
 
 def parse_args():
@@ -180,7 +182,7 @@ def parse_args():
 
     sys_args = dict(item.split('=') for item in args.p.split())
 
-    log.error('*******************************options: {}'.format(args.o))
+    log.debug('Found options: {}'.format(args.o))
     return args.v, args.d, args.size, args.num, sys_args, args.o
 
 
@@ -200,7 +202,7 @@ def set_track_active(args):
 
     # Set track active and mysql config file
     track_active = args.get('track_active', '0')
-    log.debug('Set track active to {}'.format(track_active))
+    log.info('Set track active to {}'.format(track_active))
 
     if track_active != '0':
         try:
@@ -217,7 +219,7 @@ def set_track_active(args):
             os.remove('/dmx/etc/bfapp.d/mysqld')
         except FileNotFoundError:
             pass
-        log.debug('Track active=0, bfapp.d/mysqld removed.')
+        log.info('Track active=0, bfapp.d/mysqld removed.')
 
 
 def set_mysql_cnf(args):
@@ -226,7 +228,7 @@ def set_mysql_cnf(args):
     :param args:
     :return:
     """
-    log.debug('Modifying my.cnf.')
+    log.info('Modifying my.cnf.')
     conf = configparser.ConfigParser()
     try:
         shutil.copy2('/etc/my.cnf.bak', '/etc/my.cnf')

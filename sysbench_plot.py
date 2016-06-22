@@ -4,7 +4,6 @@ A helper program to parse the sysbench logs and plot graphs.
 Usage:
     ./sysbench_plot.py -p prefix log_file(s)
 """
-import sys
 from collections import defaultdict
 import re
 import os
@@ -17,13 +16,6 @@ from matplotlib import pyplot as plt
 def parse_log(log_file, log_type):
     """
     The unction to parse sysbench log and return tuples(tps, response time) as a generator.
-    The log sample:
-    **sysbench:
-    [   1s] threads: 16, tps: 3410.72, reads: 0.00, writes: 13661.87, response time: 9.69ms (95%), errors: 0.00, reconnects:  0.00
-
-    **iostat:
-    Device:         rrqm/s   wrqm/s     r/s     w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
-    nvme0n1           0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00   0.00   0.00
 
     :param log_file:
     :param log_type:
@@ -64,19 +56,19 @@ def parse_log(log_file, log_type):
         raise
 
 
-def plot(type, data, plotfile, prefix=''):
-    if type == 'sb':
-        plot_sb(data, plotfile, prefix)
-    elif type == 'iostat':
-        plot_iostat(data, plotfile, prefix)
-    elif type == 'mpstat':
-        plot_mpstat(data, plotfile, prefix)
-    elif type == 'vmstat':
-        plot_vmstat(data, plotfile, prefix)
-    elif type == 'tdctl':
-        plot_tdctl(data, plotfile, prefix)
+def plot(p_type, data, plotfile, pre=''):
+    if p_type == 'sb':
+        plot_sb(data, plotfile, pre)
+    elif p_type == 'iostat':
+        plot_iostat(data, plotfile, pre)
+    elif p_type == 'mpstat':
+        plot_mpstat(data, plotfile, pre)
+    elif p_type == 'vmstat':
+        plot_vmstat(data, plotfile, pre)
+    elif p_type == 'tdctl':
+        plot_tdctl(data, plotfile, pre)
     else:
-        print('Invalid plot type: {}'.format(type))
+        print('Skipping: {}'.format(p_type))
         pass
 
 
@@ -120,8 +112,8 @@ def plot_tdctl(data, plotfile, prefix):
     plt.xlabel('seconds')
     plt.ylabel('IOPS')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('IOPS', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=30)
+    plt.title('IOPS', fontweight='bold')
 
     # Plot Read MBPS
     plt.subplot(2, 2, 2)
@@ -131,8 +123,8 @@ def plot_tdctl(data, plotfile, prefix):
     plt.xlabel('seconds')
     plt.ylabel('MB/s')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('Read MB/s', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=30)
+    plt.title('Read MB/s', fontweight='bold')
 
     # Plot Write MBPS
     plt.subplot(2, 2, 3)
@@ -142,8 +134,8 @@ def plot_tdctl(data, plotfile, prefix):
     plt.xlabel('seconds')
     plt.ylabel('MB/s')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('Write MB/s', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=30)
+    plt.title('Write MB/s', fontweight='bold')
 
     # Plot Latency
     plt.subplot(2, 2, 4)
@@ -153,11 +145,11 @@ def plot_tdctl(data, plotfile, prefix):
     plt.xlabel('seconds')
     plt.ylabel('latency(us)')
     plt.xlim([0, sec[-1]])
-    flat_lat = [i for i in tdctl_data[key][3] for key in tdctl_data.keys()]
+    flat_lat = [i for key in tdctl_data.keys() for i in tdctl_data[key][3]]
     max_lat = max(flat_lat)
     lat_ylim = np.percentile(np.array(flat_lat), 99)
     plt.ylim([0, lat_ylim])
-    plt.legend(fontsize=60)
+    plt.legend(fontsize=30)
     plt.title('Latency, max={}us'.format(max_lat), fontsize=60, fontweight='bold')
 
     fig = plt.gcf()
@@ -168,26 +160,31 @@ def plot_tdctl(data, plotfile, prefix):
     plt.close()
 
     # Plot the following graph iff there are warnings and/or errors.
-    flat_warn = sum(i for i in tdctl_data[key][4] for key in tdctl_data.keys())
-    flat_err = sum(i for i in tdctl_data[key][5] for key in tdctl_data.keys())
+    flat_warn = sum(i for k in tdctl_data.keys() for i in tdctl_data[k][4])
+    flat_err = sum(i for err_k in tdctl_data.keys() for i in tdctl_data[err_k][5])
 
     if flat_warn or flat_err:
         # Plot Write MBPS
+        matplotlib.rcParams.update({'font.size': 9})
+        plt.figure(figsize=(10, 6))
         plt.subplot(1, 1, 1)
         for key in tdctl_data.keys():
             plt.plot(sec, tdctl_data[key][4], label=key+'_Warn')
-            plt.plot(sec, tdctl_data[key][5], label=key + '_Err')
+            plt.plot(sec, tdctl_data[key][5], label=key+'_Err')
 
         plt.xlabel('seconds')
         plt.ylabel('count')
         plt.xlim([0, sec[-1]])
-        plt.legend(fontsize=60)
-        plt.title('Warnings and Errors', fontsize=60, fontweight='bold')
+        plt.legend(fontsize=6)
+        plt.title('Warnings and Errors', fontweight='bold')
         fig = plt.gcf()
-        fig.suptitle(title, fontsize=120, fontweight='bold')
+        fig.suptitle(title, fontweight='bold')
         plt.grid(True)
 
-        plt.savefig(plotfile)
+        head, tail = os.path.split(plotfile)
+        tail = 'errs_' + tail
+        err_plotfile = os.path.join(head, tail)
+        plt.savefig(err_plotfile)
         plt.close()
 
 
@@ -293,13 +290,13 @@ def plot_mpstat(data, plotfile, prefix=''):
     plt.title('{}_mpstat'.format(prefix), y=1.05, fontsize=10, fontweight='bold')
 
     polys = ax.stackplot(sec, mpstat, edgecolor='white', colors=colors)
-    legendProxies = []
+    legends = []
 
     for poly in polys:
-        legendProxies.append(plt.Rectangle((0, 0), 1, 1, fc=poly.get_facecolor()[0]))
+        legends.append(plt.Rectangle((0, 0), 1, 1, fc=poly.get_facecolor()[0]))
 
-    plt.legend(legendProxies, metrics, loc='upper center', bbox_to_anchor=(0.5, 1.05),
-          ncol=5, fancybox=True, shadow=True, prop={'size': 9})
+    plt.legend(legends, metrics, loc='upper center', bbox_to_anchor=(0.5, 1.05),
+               ncol=5, fancybox=True, shadow=True, prop={'size': 9})
 
     plt.savefig(plotfile)
     plt.close()
@@ -307,8 +304,7 @@ def plot_mpstat(data, plotfile, prefix=''):
 
 def plot_iostat(data, plotfile, prefix=''):
     """
-    Device:         rrqm/s   wrqm/s     r/s     w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
-
+    Plot the iostat log.
     :param data:
     :param plotfile:
     :param prefix:
@@ -318,10 +314,12 @@ def plot_iostat(data, plotfile, prefix=''):
     matplotlib.rcParams.update({'font.size': 60})
     # matplotlib.rcParams['figure.figsize'] = 40, 60
     plt.figure(figsize=(100, 60))
+    title = '{}_iostat'.format(prefix)
+
     try:
         device, _, _, rs, ws, rmbs, wmbs, avgrqsz, avgqusz, _, rawait, wawait, svctm, util = zip(*data)
         iostat_data = [rs, ws, rmbs, wmbs, avgrqsz, avgqusz, rawait, wawait, svctm, util]
-        metrics = ['r/s', 'w/s', 'rMB/s', 'wMBs', 'avgrq-sz', 'avgqu-sz', 'r_await', 'w_await', 'svctm', 'util']
+        metrics = ['r/s', 'w/s', 'rMB/s', 'wMB/s', 'avgrq-sz', 'avgqu-sz', 'r_await', 'w_await', 'svctm', 'util']
         sec = range(0, len(iostat_data[0]) * 10, 10)
         # title = 'iostat of {}'.format(device[0])
 
@@ -331,7 +329,7 @@ def plot_iostat(data, plotfile, prefix=''):
 
     for i in range(len(metrics)):
         iostat_data[i] = [float(x) for x in iostat_data[i]]
-        plt.subplot(5, 2, i+1)
+        plt.subplot(5, 2, i + 1)
         plt.plot(sec, iostat_data[i])
         plt.title(metrics[i])
         plt.ylabel(metrics[i])
@@ -339,17 +337,18 @@ def plot_iostat(data, plotfile, prefix=''):
         plt.grid(True)
 
     fig = plt.gcf()
-    fig.suptitle("{}_iostat".format(prefix), fontsize=120, fontweight='bold')
+    fig.suptitle(title, fontsize=120, fontweight='bold')
 
     plt.savefig(plotfile)
     plt.close()
 
 
-def plot_sb(data, plotfile, prefix=''):
+def plot_sb(data, plotfile, prefix):
     """
     The function to plot the data extracted by parse_log()
     :param data:
     :param plotfile:
+    :param prefix:
     :return:
     """
     try:
@@ -369,7 +368,7 @@ def plot_sb(data, plotfile, prefix=''):
     tps_avg = sum(tps) / float(len(tps))
 
     # Sometimes a spike makes the major part invisible ...
-    rt_ylim = np.percentile(np.array([float(x) for x in rt]), 99.9)
+    rt_ylim = np.percentile(np.array([float(x) for x in rt]), 99)
 
     matplotlib.rcParams.update({'font.size': 10})
 
@@ -403,16 +402,14 @@ if __name__ == '__main__':
     parser.add_argument("-p", help="the prefix of the title of the graphs", default='')
     parser.add_argument("files", nargs='*', help="the files to plot")
 
-
     args = parser.parse_args()
 
     logfile_names = args.files
-    prefix = args.p
+    title_prefix = args.p
 
     for file_name in logfile_names:
         plot_type = os.path.basename(file_name).split('_')[0]
         log_data = parse_log(file_name, plot_type)
         plot_file = file_name.split('.')[0] + '.png'
 
-        plot(plot_type, log_data, plot_file, prefix)
-
+        plot(plot_type, log_data, plot_file, title_prefix)

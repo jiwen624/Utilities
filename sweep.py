@@ -28,6 +28,7 @@ class Sweep:
     """
 
     def __init__(self, config_file):
+        assert config_file
         cnf = ConfigParser()
 
         try:
@@ -48,6 +49,7 @@ class Sweep:
             self._target = cnf.get('benchmark', 'target')
             self._duration = cnf.getint('benchmark', 'duration')
             self._db_size = cnf.get('benchmark', 'db_size').rstrip('G')
+            self._lua_script = cnf.get('benchmark', 'lua_script')
             self._tblsize = self._get_table_size()
             self._tblnum = self._get_table_num()
 
@@ -137,23 +139,49 @@ class Sweep:
     def sysbench_threads(self):
         return self._threads
 
+    def _run_remote2(self, cmd):
+        """
+        The new interface to run a command remotely,
+        with the enhancement that show remote output in real time
+        :param cmd:
+        :return:
+        """
+        assert cmd
+        log.info('[db] {}'.format(cmd))
+
+        trans = paramiko.Transport(self._db_ip, 22)
+        key_path = os.path.expanduser('~/.ssh/id_rsa')
+        key = paramiko.RSAKey.from_private_key_file(key_path)
+        trans.connect(username=self._user, pkey=key)
+        session = trans.open_channel("session")
+        session.exec_command(cmd)
+
+        result = ''
+        while not session.exit_status_ready():
+            if session.recv_ready():
+                buff = session.recv(4096).decode('utf-8')
+                log.info('[db] {}'.format(buff))
+                result += buff
+        return result
+
     def _run_remote(self, cmd):
         """
         Run a remote command in synchronise mode
         :param cmd: a command
         :return:
         """
-        assert cmd is not None
+        assert cmd
 
-        log.debug('[db] {}'.format(cmd))
+        log.info('[db] {}'.format(cmd))
         conn = paramiko.SSHClient()
         conn.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        conn.connect(self._db_ip, 22, self._user, '~/.ssh/id_rsa')
+        conn.connect(self._db_ip, 22, self._user, key_filename='~/.ssh/id_rsa')
 
         stdin, stdout, stderr = conn.exec_command(cmd)
+
         err, out = stderr.readlines(), stdout.readlines()
         conn.close()
-        log.debug('(ret={}) {}'.format(str(err), ''.join(out)))
+        log.info('(ret={}) {}'.format(str(err), ''.join(out)))
 
         return err, out
 
@@ -163,7 +191,8 @@ class Sweep:
         :param cmd:
         :return:
         """
-        return self._run_remote(cmd)
+        # return self._run_remote(cmd)
+        return self._run_remote2(cmd)
 
     def _run_local(self, commands, timeout):
         """
@@ -171,7 +200,6 @@ class Sweep:
         :param commands:
         :return:
         """
-        # return self._ssh_run('client', cmd)
         assert commands
         if not isinstance(commands, list):
             if isinstance(commands, str):
@@ -179,7 +207,7 @@ class Sweep:
             else:
                 raise RuntimeError("[client] Invalid cmd: {}".format(commands))
 
-        log.debug('[client]:\n{}'.format('\n'.join(commands)))
+        log.info('[client]:\n{}'.format('\n'.join(commands)))
 
         self._running_procs = [Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE) for cmd in commands]
 
@@ -196,7 +224,7 @@ class Sweep:
                         log.error('[client] failed: (ret= {}, results={})'.format(ret, results_str))
                         raise RuntimeError(errors.decode('utf-8'))
                     else:
-                        log.debug('[client] finished: (ret= {}, results={})'.format(ret, results_str))
+                        log.info('[client] finished: (ret= {}, results={})'.format(ret, results_str))
 
                         self._running_procs.remove(proc)
                     break
@@ -205,7 +233,7 @@ class Sweep:
 
             run_time += 5
             if run_time > timeout:
-                log.debug('Timeout ({} sec): all running processes will be killed'.format(timeout))
+                log.info('Timeout ({} sec): all running processes will be killed'.format(timeout))
                 for proc in self._running_procs:
                     proc.kill()
                 break
@@ -229,7 +257,7 @@ class Sweep:
                                       'cleandb.py')
 
         skip_db_recreation = '-o skip_db_recreation' if self._skip_db_recreation else ''
-        cmd_template = '{cleanup_script} {db_size} {db_num} {skip_db_recreation} -vv -p "{parameters}" 2>&1'
+        cmd_template = '{cleanup_script} {db_size} {db_num} {skip_db_recreation} -v -p "{parameters}" 2>&1'
         clean_db_cmd = cmd_template.format(cleanup_script=cleanup_script,
                                            db_size=self._db_size,
                                            db_num=self._db_num,
@@ -277,7 +305,7 @@ class Sweep:
         self.kill_proc(proc_names)
 
         time.sleep(5)
-        log.debug('Client is ready.')
+        log.info('Client is ready.')
 
     def run_one_test(self, thread_num):
         """
@@ -294,7 +322,7 @@ class Sweep:
         all_cmds = []
 
         cmd_template = 'sysbench ' \
-                       '--test=/usr/local/src/sysbench/sysbench/tests/db/oltp.lua ' \
+                       '--test={lua_script} ' \
                        '--oltp-table-size={oltp_table_size} ' \
                        '--oltp-tables-count={oltp_tables_count} ' \
                        '--mysql-host={mysql_host} ' \
@@ -317,11 +345,13 @@ class Sweep:
                        'run > {file_name}'
 
         for port in range(int(self._db_port), int(self._db_port) + int(self._db_num)):
-            sb_log_file = '{}/sb_{}_{}_db{}.log'.format(self._log_dir,
-                                                        self._target,
-                                                        thread_num,
-                                                        port - int(self._db_port) + 1)
-            sb_cmd = cmd_template.format(oltp_table_size=self._tblsize,
+            sb_logfile_tail = 'sb_{}_{}_db{}.log'.format(self._target,
+                                                         thread_num,
+                                                         port - int(self._db_port) + 1)
+            sb_log_file = os.path.join(self._log_dir, sb_logfile_tail)
+
+            sb_cmd = cmd_template.format(lua_script=self._lua_script,
+                                         oltp_table_size=self._tblsize,
                                          oltp_tables_count=self._tblnum,
                                          mysql_host=self._db_ip,
                                          mysql_port=port,
@@ -339,7 +369,6 @@ class Sweep:
             all_cmds.append(sb_cmd)
             current_log_files.append(sb_log_file)
 
-        # we shouldn't use root here
         os_cmds = ('iostat -dmx {} -y'.format(self._ssd_device),
                    'mpstat',
                    'vmstat -S M -w',
@@ -354,7 +383,7 @@ class Sweep:
             all_cmds.append(sys_mon_cmd)
             current_log_files.append(sys_log_file)
 
-        self.client_cmd(all_cmds, self._duration+60)
+        self.client_cmd(all_cmds, self._duration + 60)
         self._sweep_logs.extend(current_log_files)
         return current_log_files
 
@@ -365,7 +394,7 @@ class Sweep:
         """
         log.info('Plotting the sweep')
         plot_files = ' '.join(self._sweep_logs)
-        plot_cmd = 'sysbench_plot.py {}'.format(plot_files)
+        plot_cmd = 'sysbench_plot.py -p {} {}'.format(self._sweep_name, plot_files)
 
         # The timeout of plot is 600 seconds, it will be killed if not return before timeout
         self.client_cmd(plot_cmd, 600)
@@ -397,7 +426,7 @@ class Sweep:
                             "-s \"{subject}\" " \
                             "-a {attachment} " \
                             "-B \"{msg_body}\""
-        subject_str = "Sweep result of {}".format(self._sweep_name)
+        subject_str = "Logs and graphs for sweep {}".format(self._sweep_name)
         msg_body = 'Please see attached.'
         sendmail_cmd = [sendmail_template.format(sender=self._mail_sender,
                                                  recipients=self._mail_recipients,
@@ -412,15 +441,20 @@ class Sweep:
     def result_is_good(current_log_files):
         """
         Check if the benchmark has been done successfully and raise an RuntimeError if some error happens.
+        It's considered good if the sb_*.log (sysbench logs) contains 'execution time' in the tail.
         :param current_log_files:
         :return:
         """
         log.info('Checking if the sweep is in good state.')
         assert current_log_files
-        check_cmd = "tail -2 TestSweep/TestSweep_DMX_16_db1.log | awk '{print $1, $2}'"
-        started = check_output(check_cmd, shell=True)
-        started = started.decode('utf-8').replace('\n', ' ')
-        return 'execution time' in started
+        for file in current_log_files:
+            _, tail = os.path.split(file)
+            if tail.startswith('sb'):
+                check_cmd = "tail -2 {} | awk '{{print $1, $2}}'".format(file)
+                started = check_output(check_cmd, shell=True).decode('utf-8').replace('\n', ' ')
+                if 'execution time' not in started:
+                    return False
+        return True
 
     def start(self):
         """
@@ -434,14 +468,16 @@ class Sweep:
 
         # Copy the sweep config file to the sweep directory.
         shutil.copy2(self._cnf_file, os.path.join(self._log_dir, self._cnf_file))
+        shutil.copy2('/etc/my.cnf', os.path.join(self._log_dir, 'my.cnf'))
         shutil.copy2('/dmx/etc/bfapp.d/mysqld', os.path.join(self._log_dir, 'bfapp.d.mysqld'))
         shutil.copy2('/dmx/etc/bfcs.d/mysqld', os.path.join(self._log_dir, 'bfcs.d.mysqld'))
         # Get the barf command print and write to a log file
-        barf_file = os.path.join(self._log_dir, 'barf.log')
+        barf_file = os.path.join(self._log_dir, 'barf.out')
+
         barf_cmd = 'ssh {user}@{db_ip} barf -v -l >{barf_file};sync'.format(user=self._user,
-                                                                       db_ip=self._db_ip,
-                                                                       barf_file=barf_file)
-        self.client_cmd(barf_cmd, timeout=600)
+                                                                            db_ip=self._db_ip,
+                                                                            barf_file=barf_file)
+        self.client_cmd(barf_cmd, timeout=120)
 
         log.info('Sweep <{}> started.'.format(self._sweep_name))
         for threads in self._threads:
@@ -450,7 +486,7 @@ class Sweep:
             sweep.clean_db()
             if not self.result_is_good(sweep.run_one_test(threads)):
                 raise RuntimeError('At least one of the benchmark is finished but some error happened.')
-            shutil.copy2('/etc/my.cnf', os.path.join(self._log_dir, 'my.cnf'))
+
             log.info('Benchmark for {} threads has finished.'.format(threads))
 
         if self._plot:
@@ -467,7 +503,6 @@ if __name__ == "__main__":
     parser.add_argument("config", help="config file name/path")
     parser.add_argument("-v", help="detailed print( -v: info, -vv: debug)",
                         action='count', default=0)
-
 
     args = parser.parse_args()
 
@@ -489,4 +524,4 @@ if __name__ == "__main__":
         log.warning('Received SIGINT. I will kill the running processes')
         for process in sweep.running_procs:
             process.kill()
-        sys.exit(0)
+    sys.exit(0)
