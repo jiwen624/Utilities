@@ -2,6 +2,10 @@
 """This sweep program is used to run MySQL benchmarks with various configurations in client/server.
     Run this command on the client server.
     External dependencies: sysbench_plot.py, cleandb.py
+    
+    History:
+    1. Removed 'sweep_name' from config file. -- @EricYang v0.6 Aug 11, 2016
+    2. Changed threading.Timer handler        -- @EricYang v0.61 Aug 25, 2016
 """
 import os
 import re
@@ -9,6 +13,8 @@ import time
 import sys
 import logging
 import psutil
+import threading
+import select
 import argparse
 import paramiko
 import zipfile
@@ -42,7 +48,8 @@ class Sweep:
             self._dbscript_path = cnf.get('server', 'dbscript_path')
 
             # section: benchmark
-            self._sweep_name = cnf.get('benchmark', 'sweep_name')
+            # self._sweep_name = cnf.get('benchmark', 'sweep_name')
+            self._sweep_name, _ = os.path.splitext(self._cnf_file)
             self._log_dir = self._sweep_name
             self._threads = cnf.get('benchmark', 'sysbench_threads').split(sep=',')
             self._db_num = cnf.get('benchmark', 'db_num')
@@ -75,7 +82,7 @@ class Sweep:
 
             # section: misc
             self._plot = True if cnf.get('misc', 'plot') == 'true' else False
-            self._send_mail = True if cnf.get('misc', 'send_mail') else False
+            self._send_mail = True if cnf.get('misc', 'send_mail') == 'true' else False
             if self._send_mail:
                 self._mail_sender = cnf.get('misc', 'mail_sender')
                 self._mail_recipients = cnf.get('misc', 'mail_recipients')
@@ -159,7 +166,7 @@ class Sweep:
         result = ''
         while not session.exit_status_ready():
             if session.recv_ready():
-                buff = session.recv(4096).decode('utf-8')
+                buff = session.recv(4096).decode('utf-8').strip()
                 log.info('[db] {}'.format(buff))
                 result += buff
         return result
@@ -207,36 +214,61 @@ class Sweep:
             else:
                 raise RuntimeError("[client] Invalid cmd: {}".format(commands))
 
-        log.info('[client]:\n{}'.format('\n'.join(commands)))
+        self._running_procs = [Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE,
+                                     universal_newlines=True, close_fds=True) for cmd in commands]
+        watcher = threading.Timer(timeout, self.kill_running_procs)
+        watcher.start()
+        p = select.epoll()
+        pipe_dict = {}
 
-        self._running_procs = [Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE) for cmd in commands]
+        for proc in self._running_procs:
+            p.register(proc.stdout, select.POLLIN | select.POLLERR | select.POLLHUP)
+            stdout_fileno = proc.stdout.fileno()
+            pipe_dict[stdout_fileno] = proc.stdout
+            log.info('[client] (id:{}) cmd=({})'.format(stdout_fileno, proc.args))
 
-        run_time = 0
         while self._running_procs:
-            time.sleep(5)
+            result = p.poll(timeout=5000)
+            if len(result):
+                for m in result:
+                    if m[1] & select.POLLIN:
+                        log.debug('[client] (id:{}) {}'.format(m[0], pipe_dict[m[0]].readline().strip()))
+
             for proc in self._running_procs:
                 ret = proc.poll()
                 if ret is not None:  # Process finished.
-                    results, errors = proc.communicate()
-                    results_str = results.decode('utf-8').rstrip()
+                    _, errors_raw = proc.communicate()
+                    errors = errors_raw.rstrip()
 
-                    if ret != 0:
-                        log.error('[client] failed: (ret= {}, results={})'.format(ret, results_str))
-                        raise RuntimeError(errors.decode('utf-8'))
+                    if ret != 0:  # Process failed.
+                        log.error('[client] command failed: {}'.format(proc.args))
+                        log.error('[client] (errs={})'.format(errors))
+                        # watcher.cancel()
+
+                        if 'sysbench' in proc.args:  # sysbench failure is a critical error.
+                            watcher.cancel()
+                            raise RuntimeError
+                        else:  # Just ignore failures from the other commands
+                            self._running_procs.remove(proc)
                     else:
-                        log.info('[client] finished: (ret= {}, results={})'.format(ret, results_str))
-
+                        log.info('[client] finished: (cmd={})'.format(proc.args))
                         self._running_procs.remove(proc)
                     break
                 else:  # No process is done, just do nothing and check the next command in the running_procs list.
                     continue
+        # We need to cancel the watcher here as we don't need it any more.
+        watcher.cancel()
+        watcher.join(timeout=10)
 
-            run_time += 5
-            if run_time > timeout:
-                log.info('Timeout ({} sec): all running processes will be killed'.format(timeout))
-                for proc in self._running_procs:
-                    proc.kill()
-                break
+    def kill_running_procs(self):
+        log.info('[client] Timeout! Commands still running will be killed.')
+        procs = self._running_procs
+        self._running_procs = []
+
+        for proc in procs:
+            log.debug('[client] Preparing to kill: {} but proc.kill may get stuck randomly.'.format(proc.args))
+            proc.kill()
+            log.debug('[client] Process killed: {}.'.format(proc.args))
 
     def client_cmd(self, cmds, timeout):
         """
@@ -304,6 +336,11 @@ class Sweep:
 
         self.kill_proc(proc_names)
 
+        # Kill previous sweep which may still be running
+        _, exec_file = os.path.split(__file__)
+        self_pid = os.getpid()
+        self.kill_proc(exec_file, self_pid)
+
         time.sleep(5)
         log.info('Client is ready.')
 
@@ -317,7 +354,7 @@ class Sweep:
         """
         assert thread_num is not None
 
-        log.info('Running test of {} threads'.format(thread_num))
+        log.info('Running test of {} sysbench threads'.format(thread_num))
         current_log_files = []
         all_cmds = []
 
@@ -342,6 +379,7 @@ class Sweep:
                        '--oltp-distinct-ranges={oltp_distinct_ranges} ' \
                        '--oltp-index-updates={oltp_index_updates} ' \
                        '--oltp_non_index_updates={oltp_non_index_updates} ' \
+                       '--rand-init=on --rand-type=uniform ' \
                        'run > {file_name}'
 
         for port in range(int(self._db_port), int(self._db_port) + int(self._db_num)):
@@ -394,7 +432,7 @@ class Sweep:
         """
         log.info('Plotting the sweep')
         plot_files = ' '.join(self._sweep_logs)
-        plot_cmd = 'sysbench_plot.py -p {} {}'.format(self._sweep_name, plot_files)
+        plot_cmd = './sysbench_plot.py -p {} {}'.format(self._sweep_name, plot_files)
 
         # The timeout of plot is 600 seconds, it will be killed if not return before timeout
         self.client_cmd(plot_cmd, 600)
@@ -418,7 +456,7 @@ class Sweep:
         """
         log.info('Send an email to the recipients.')
         attachment = self._compress()
-        sendmail_template = "mailto.py " \
+        sendmail_template = "./mailto.py " \
                             "{sender} " \
                             "{recipients} " \
                             "-S {smtp_server} " \
@@ -451,7 +489,7 @@ class Sweep:
             _, tail = os.path.split(file)
             if tail.startswith('sb'):
                 check_cmd = "tail -2 {} | awk '{{print $1, $2}}'".format(file)
-                started = check_output(check_cmd, shell=True).decode('utf-8').replace('\n', ' ')
+                started = check_output(check_cmd, shell=True, universal_newlines=True).replace("\n", " ")
                 if 'execution time' not in started:
                     return False
         return True
@@ -466,25 +504,13 @@ class Sweep:
         except FileExistsError:
             pass
 
-        # Copy the sweep config file to the sweep directory.
-        shutil.copy2(self._cnf_file, os.path.join(self._log_dir, self._cnf_file))
-        shutil.copy2('/etc/my.cnf', os.path.join(self._log_dir, 'my.cnf'))
-        shutil.copy2('/dmx/etc/bfapp.d/mysqld', os.path.join(self._log_dir, 'bfapp.d.mysqld'))
-        shutil.copy2('/dmx/etc/bfcs.d/mysqld', os.path.join(self._log_dir, 'bfcs.d.mysqld'))
-        # Get the barf command print and write to a log file
-        barf_file = os.path.join(self._log_dir, 'barf.out')
-
-        barf_cmd = 'ssh {user}@{db_ip} barf -v -l >{barf_file};sync'.format(user=self._user,
-                                                                            db_ip=self._db_ip,
-                                                                            barf_file=barf_file)
-        self.client_cmd(barf_cmd, timeout=120)
-
-        log.info('Sweep <{}> started.'.format(self._sweep_name))
+        log.info('Sweep <{}> started, check logs under the directory with that name.'.format(self._sweep_name))
         for threads in self._threads:
             log.info('Benchmark for {} threads has started.'.format(threads))
             sweep.clean_client()
             sweep.clean_db()
             if not self.result_is_good(sweep.run_one_test(threads)):
+                log.error('Benchmark for {} threads has failed. Exiting...'.format(threads))
                 raise RuntimeError('At least one of the benchmark is finished but some error happened.')
 
             log.info('Benchmark for {} threads has finished.'.format(threads))
@@ -492,8 +518,34 @@ class Sweep:
         if self._plot:
             self.plot()
 
+        # Copy the sweep config file to the sweep directory.
+        try:
+            shutil.copy2(self._cnf_file, os.path.join(self._log_dir, self._cnf_file))
+            shutil.copy2('/etc/my.cnf', os.path.join(self._log_dir, 'my.cnf'))
+            if self._target == 'DMX':
+                shutil.copy2('/dmx/etc/bfapp.d/mysqld', os.path.join(self._log_dir, 'bfapp.d.mysqld'))
+                shutil.copy2('/dmx/etc/bfcs.d/mysqld', os.path.join(self._log_dir, 'bfcs.d.mysqld'))
+            else:
+                pass
+        except FileNotFoundError as e:
+            log.warning('Failed to copy dmx/mysql config files: {}'.format(e))
+
+        # Get the barf command print and write to a log file
+        barf_file = os.path.join(self._log_dir, 'barf.out')
+        barf_cmd = 'ssh {user}@{db_ip} barf -v -l >{barf_file};sync'.format(user=self._user,
+                                                                            db_ip=self._db_ip,
+                                                                            barf_file=barf_file)
+        self.client_cmd(barf_cmd, timeout=120)
+
         if self._send_mail:
             self.send_mail()
+
+        # Change the .cnf file to .done
+        try:
+            pure_filename, _ = os.path.splitext(self._cnf_file)
+            os.rename(self._cnf_file, pure_filename+'.done')
+        except OSError as e:
+            log.warning('Failed to rename the config file: {}'.format(e))
 
 
 if __name__ == "__main__":
@@ -513,9 +565,11 @@ if __name__ == "__main__":
     else:
         log_level = logging.DEBUG
 
-    logging.basicConfig(level=log_level)
+    logging.basicConfig(level=log_level, stream=sys.stdout, format='%(asctime)s %(levelname)s: %(message)s')
+    # I don't want to see paramiko debug logs, unless they are WARNING or worse.
     logging.getLogger("paramiko").setLevel(logging.WARNING)
 
+    log.debug('\n\n****New sweep config file found, preparing to start.****')
     sweep = Sweep(args.config)
     try:
         sweep.start()
