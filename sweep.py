@@ -4,8 +4,17 @@
     External dependencies: sysbench_plot.py, cleandb.py
     
     History:
+    0. Initial version created.               -- @EricYang v0.1 March xx, 2016
+    ...
+    
     1. Removed 'sweep_name' from config file. -- @EricYang v0.6 Aug 11, 2016
     2. Changed threading.Timer handler        -- @EricYang v0.61 Aug 25, 2016
+    3. Changes:
+           Added 'tarball_path' as a new config option
+           Log directory of a failed benchmark will be renamed to 'failed_blabla'
+           Added logs for commands: lscpu, free, etc
+                                              --@EricYang v0.62 Aug 30, 2016
+    4. Added 'mysql_base_dir' to the .cnf file --@EricYang v0.63 Aug 31, 2016
 """
 import os
 import re
@@ -27,7 +36,7 @@ log = logging.getLogger('')
 
 class Sweep:
     """
-    This class launch a sysbench benchmark sweep with various threads.
+    This class launches a sysbench benchmark sweep with a certain number of threads.
     Usage:
         sweep = Sweep('test.cnf')
         sweep.start()
@@ -55,10 +64,14 @@ class Sweep:
             self._db_num = cnf.get('benchmark', 'db_num')
             self._target = cnf.get('benchmark', 'target')
             self._duration = cnf.getint('benchmark', 'duration')
-            self._db_size = cnf.get('benchmark', 'db_size').rstrip('G')
+            # self._db_size = cnf.get('benchmark', 'db_size').rstrip('G')
             self._lua_script = cnf.get('benchmark', 'lua_script')
-            self._tblsize = self._get_table_size()
-            self._tblnum = self._get_table_num()
+            self._tarball_path = cnf.get('benchmark', 'tarball_path')
+            # self._tblsize = self._get_table_size()
+            # self._tblnum = self._get_table_num()
+            self._tblsize = cnf.get('benchmark', 'table_rows')
+            self._tblnum = cnf.get('benchmark', 'table_num')
+            self._base_dir = cnf.get('benchmark', 'mysql_base_dir')
 
             # section: workload
             self._workload = cnf.get('workload', 'workload_type')
@@ -119,6 +132,7 @@ class Sweep:
     def _get_table_size(self):
         """
         The matrix to map database size to table size (how many rows per table)
+        ** This function is no longer used **
         :return:
         """
         matrix = {'84': 1000000,
@@ -132,6 +146,7 @@ class Sweep:
     def _get_table_num(self):
         """
         The matrix to map database size to table count (how many tables)
+        ** This function is no longer used **
         :return:
         """
         matrix = {'84': 350,
@@ -289,11 +304,13 @@ class Sweep:
                                       'cleandb.py')
 
         skip_db_recreation = '-o skip_db_recreation' if self._skip_db_recreation else ''
-        cmd_template = '{cleanup_script} {db_size} {db_num} {skip_db_recreation} -v -p "{parameters}" 2>&1'
+        cmd_template = '{cleanup_script} {db_num} {skip_db_recreation} ' \
+                       '-d {base_dir} -z {tarball} -v -p "{parameters}" 2>&1'
         clean_db_cmd = cmd_template.format(cleanup_script=cleanup_script,
-                                           db_size=self._db_size,
                                            db_num=self._db_num,
                                            skip_db_recreation=skip_db_recreation,
+                                           base_dir=self._base_dir,
+                                           tarball=self._tarball_path,
                                            parameters=self._db_parms,
                                            log_path=self._dbscript_path)
         self.db_cmd(clean_db_cmd)
@@ -491,6 +508,7 @@ class Sweep:
                 check_cmd = "tail -2 {} | awk '{{print $1, $2}}'".format(file)
                 started = check_output(check_cmd, shell=True, universal_newlines=True).replace("\n", " ")
                 if 'execution time' not in started:
+                    log.warning('Found error in {}.'.format(file))
                     return False
         return True
 
@@ -511,7 +529,13 @@ class Sweep:
             sweep.clean_db()
             if not self.result_is_good(sweep.run_one_test(threads)):
                 log.error('Benchmark for {} threads has failed. Exiting...'.format(threads))
-                raise RuntimeError('At least one of the benchmark is finished but some error happened.')
+                # Rename the log directory with a prefix 'failed_'
+                try:
+                    os.rename(self._log_dir, 'failed_'+self._log_dir)
+                except OSError as e:
+                    log.warning('Failed to rename the log directory: {}'.format(e))
+
+                raise RuntimeError('At least one of the benchmark is finished but some errors happened.')
 
             log.info('Benchmark for {} threads has finished.'.format(threads))
 
@@ -532,10 +556,19 @@ class Sweep:
 
         # Get the barf command print and write to a log file
         barf_file = os.path.join(self._log_dir, 'barf.out')
-        barf_cmd = 'ssh {user}@{db_ip} barf -v -l >{barf_file};sync'.format(user=self._user,
-                                                                            db_ip=self._db_ip,
-                                                                            barf_file=barf_file)
-        self.client_cmd(barf_cmd, timeout=120)
+        barf_cmd = 'ssh {user}@{db_ip} barf --dv &>{barf_file};' \
+                   'barf -v -l &>>{barf_file};sync'.format(user=self._user,
+                                                           db_ip=self._db_ip,
+                                                           barf_file=barf_file)
+        self.client_cmd(barf_cmd, timeout=10)
+
+        # Get the dmidecode command print and write to a log file
+        osinfo_file = os.path.join(self._log_dir, 'os_info.out')
+        osinfo_cmd = 'ssh {user}@{db_ip} lscpu &>{osinfo_file};' \
+                     'free &>>{osinfo_file};sync'.format(user=self._user,
+                                                        db_ip=self._db_ip,
+                                                        osinfo_file=osinfo_file)
+        self.client_cmd(osinfo_cmd, timeout=10)
 
         if self._send_mail:
             self.send_mail()
@@ -543,7 +576,7 @@ class Sweep:
         # Change the .cnf file to .done
         try:
             pure_filename, _ = os.path.splitext(self._cnf_file)
-            os.rename(self._cnf_file, pure_filename+'.done')
+            os.rename(self._cnf_file, pure_filename + '.done')
         except OSError as e:
             log.warning('Failed to rename the config file: {}'.format(e))
 
@@ -551,7 +584,7 @@ class Sweep:
 if __name__ == "__main__":
     """The main function to run the sweep.
     """
-    parser = argparse.ArgumentParser(description="This program run the benchmarks defined by a config file.")
+    parser = argparse.ArgumentParser(description="This program runs the benchmarks defined by a config file.")
     parser.add_argument("config", help="config file name/path")
     parser.add_argument("-v", help="detailed print( -v: info, -vv: debug)",
                         action='count', default=0)
@@ -566,10 +599,10 @@ if __name__ == "__main__":
         log_level = logging.DEBUG
 
     logging.basicConfig(level=log_level, stream=sys.stdout, format='%(asctime)s %(levelname)s: %(message)s')
-    # I don't want to see paramiko debug logs, unless they are WARNING or worse.
+    # I don't want to see paramiko debug logs, unless they are WARNING or worse than that.
     logging.getLogger("paramiko").setLevel(logging.WARNING)
 
-    log.debug('\n\n****New sweep config file found, preparing to start.****')
+    log.info('\n\n****New sweep config file found, preparing to start.****')
     sweep = Sweep(args.config)
     try:
         sweep.start()
