@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env /usr/bin/python3
 """
 This program gathers the data of tps (transactions per seconds) and rt (response time)
 and draw Excel charts.
@@ -36,9 +36,6 @@ def parse_sb_log(log_file):
     tps_std = float(numpy.std(numpy.array(tps_arr), axis=0))
     rt_std = float(numpy.std(numpy.array(rt_arr), axis=0))
 
-    if 'DMX_RWD_3_64' in log_file:
-        print(rt_arr)
-        print(rt_std)
     return tps, rt, avg_rt, tps_std, rt_std
 
 
@@ -84,9 +81,10 @@ def parse_all_sblogs(base_dir):
 
     for name in sorted(os.listdir(base_dir), reverse=True):
         abspath = os.path.join(base_dir, name)
-        if os.path.isdir(abspath):
+        # Ignore directories start with 'failed_'
+        if os.path.isdir(abspath) and not abspath.startswith('failed_'):
             # print(name, end=' ')
-            thread_num = name.split('_')[-1]
+            thread_num = name.split('_')[3]
             sblog_dict[thread_num].append(get_tps_rt(abspath))
 
     for key in sblog_dict.keys():
@@ -125,18 +123,18 @@ def get_sheetname_by_workload(workload_type):
     """
     wl_type_lower = workload_type.lower()
 
-    if wl_type_lower == 'ro':
-        sheet_name = wl_type_lower + ' (rw_ratio ' + '1v0)'
-    elif wl_type_lower == 'wo':
-        sheet_name = wl_type_lower + ' (rw_ratio ' + '0v1)'
-    elif wl_type_lower == 'rw':
-        sheet_name = wl_type_lower + ' (rw_ratio ' + '6v4)'
-    elif wl_type_lower == 'rwd':
-        sheet_name = wl_type_lower + ' (rw_ratio ' + '4v6)'
-    else:
-        sheet_name = wl_type_lower
-    return sheet_name
-
+    # if wl_type_lower == 'ro':
+    #    sheet_name = wl_type_lower + ' (rw_ratio ' + '1v0)'
+    # elif wl_type_lower == 'wo':
+    #    sheet_name = wl_type_lower + ' (rw_ratio ' + '0v1)'
+    #elif wl_type_lower == 'rw':
+    #    sheet_name = wl_type_lower + ' (rw_ratio ' + '6v4)'
+    #elif wl_type_lower == 'rwd':
+    #    sheet_name = wl_type_lower + ' (rw_ratio ' + '4v6)'
+    #else:
+    #    sheet_name = wl_type_lower
+    #return sheet_name
+    return wl_type_lower
 
 def get_wl_from_sheetname(name):
     return name.split()[0].upper()
@@ -212,7 +210,7 @@ def draw_excel_charts(sblog_dict, excel_filename):
         chart_tps.title = "TPS chart of {}".format(ws.title)
         chart_tps.y_axis.title = 'tps'
         chart_tps.y_axis.scaling.min = 0
-        chart_tps.x_axis.title = 'threads'
+        chart_tps.x_axis.title = 'tps'
 
         data_tps = Reference(ws, min_col=2, min_row=1,
                              max_row=workload_cols_rows[get_wl_from_sheetname(ws.title)]['rows'],
@@ -232,7 +230,7 @@ def draw_excel_charts(sblog_dict, excel_filename):
         chart_rt.title = "Response Time(95%) chart of {}".format(ws.title)
         chart_rt.y_axis.title = 'rt'
         chart_rt.y_axis.scaling.min = 0
-        chart_rt.x_axis.title = 'threads'
+        chart_rt.x_axis.title = 'response time'
 
         data_rt = Reference(ws, min_col=workload_cols_rows[get_wl_from_sheetname(ws.title)]['cols'] / 5 + 2,
                             min_row=1,
@@ -253,7 +251,7 @@ def draw_excel_charts(sblog_dict, excel_filename):
         chart_avg_rt.title = "Average Response Time chart of {}".format(ws.title)
         chart_avg_rt.y_axis.title = 'avg rt'
         chart_avg_rt.y_axis.scaling.min = 0
-        chart_avg_rt.x_axis.title = 'threads'
+        chart_avg_rt.x_axis.title = 'avg resp time'
 
         data_avg_rt = Reference(ws, min_col=workload_cols_rows[get_wl_from_sheetname(ws.title)]['cols'] * 2 / 5 + 2,
                                 min_row=1,
@@ -274,7 +272,7 @@ def draw_excel_charts(sblog_dict, excel_filename):
         chart_tps_std.title = "tps standard deviation chart of {}".format(ws.title)
         chart_tps_std.y_axis.title = 'std'
         chart_tps_std.y_axis.scaling.min = 0
-        chart_tps_std.x_axis.title = 'threads'
+        chart_tps_std.x_axis.title = 'tps std'
 
         data_tps_std = Reference(ws, min_col=workload_cols_rows[get_wl_from_sheetname(ws.title)]['cols'] * 3 / 5 + 2,
                                 min_row=1,
@@ -295,7 +293,7 @@ def draw_excel_charts(sblog_dict, excel_filename):
         chart_rt_std.title = "response time standard deviation chart of {}".format(ws.title)
         chart_rt_std.y_axis.title = 'std'
         chart_rt_std.y_axis.scaling.min = 0
-        chart_rt_std.x_axis.title = 'threads'
+        chart_rt_std.x_axis.title = 'rt std'
 
         data_rt_std = Reference(ws, min_col=workload_cols_rows[get_wl_from_sheetname(ws.title)]['cols'] * 4 / 5 + 2,
                                 min_row=1,

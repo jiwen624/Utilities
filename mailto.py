@@ -39,7 +39,8 @@ def send_mail(args):
 
     """
 
-    password = getpass.getpass('Enter your password: ')
+    # password = getpass.getpass('Enter your password: ')
+    password = ''
     smtp_server = args['smtp_server']
     sender = args['sender']
     cc = ''

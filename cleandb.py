@@ -1,4 +1,4 @@
-#!/usr/bin/env /opt/rh/python33/root/usr/bin/python
+#!/usr/bin/env python3
 """Clean the database server environment and setup a new one
     - kill all the database processes
     - remove old database files
@@ -25,6 +25,7 @@ def kill_proc(proc_name, skip_pid=0):
     """
     Kill a process by name.
     :param proc_name:
+    :param skip_pid:
     :return:
     """
     assert proc_name is not None
@@ -36,12 +37,13 @@ def kill_proc(proc_name, skip_pid=0):
             pids.append(proc.pid)
             proc.kill()
 
-    # But the process may be restarted by a daemon.
-    # time.sleep(5)
-    # for pid in pids:
-    #     if psutil.pid_exists(pid):
-    #         raise RuntimeError('Failed to kill process {} with pid {}'.format(proc_name, pid))
-    #
+            # But the process may be restarted by a daemon.
+            # time.sleep(5)
+            # for pid in pids:
+            #     if psutil.pid_exists(pid):
+            #         raise RuntimeError('Failed to kill process {} with pid {}'.format(proc_name, pid))
+            #
+
 
 def remove_db(basedir):
     """
@@ -60,24 +62,29 @@ def remove_db(basedir):
             shutil.rmtree(abspath)
 
 
-def create_db(basedir, dbsize, dbnum):
+def create_db(basedir, dbnum, tarball):
     """
     Create database directories and untar databases to them.
     :param basedir:
-    :param dbsize:
     :param dbnum:
+    :param tarball:
     :return:
     """
-    assert basedir and dbsize and dbnum
+    assert basedir and tarball and dbnum
 
     for i in range(1, dbnum + 1):
         abspath = os.path.join(basedir, 'mysql{}'.format(i))
         log.debug('Creating directory: {}'.format(abspath))
-        os.mkdir(abspath)
+        try:
+            os.mkdir(abspath)
+        except FileExistsError:
+            pass
 
-    log.info('Untar database files for database 1-{}.'.format(dbnum))
-    untar_cmd = 'tar zxf /home/sysbench_backup_{}g.tar.gz --strip-components 1 -C {}/mysql{}'
-    running_procs = [Popen(untar_cmd.format(dbsize, base_dir, i), shell=True, stdout=PIPE, stderr=PIPE)
+    log.info('Untar database 1-{} to {} from {}.'.format(dbnum, base_dir, tarball))
+    # untar_cmd = 'tar zxf {} --strip-components 1 -C {}/mysql{}'
+    untar_cmd = 'tar -xf {tarball} --use-compress-program=pigz --strip-components 1 -C {base_dir}/mysql{i}'
+    running_procs = [Popen(untar_cmd.format(tarball=tarball, base_dir=base_dir, i=i),
+                           shell=True, stdout=PIPE, stderr=PIPE)
                      for i in range(1, dbnum + 1)]
     while running_procs:
         for proc in running_procs:
@@ -105,16 +112,15 @@ def create_db(basedir, dbsize, dbnum):
     log.info('Finished to prepare the database.')
 
 
-def prepare_db(basedir, dbsize, dbnum, options):
+def prepare_db(basedir, dbnum, tarball, options=None):
     """
-    Clean the database environment and setup a new one.
+    Clean up the database environment and setup a new one.
     :param basedir:
-    :param dbsize:
     :param dbnum:
     :param options:
+    :param tarball:
     :return:
     """
-    assert dbsize is not None
     assert dbnum is not None
     if not options:
         options = []
@@ -125,7 +131,7 @@ def prepare_db(basedir, dbsize, dbnum, options):
     kill_proc('mysql')
     kill_proc('mysqladmin')
     kill_proc('tar')
-    kill_proc('zip')
+    kill_proc('pigz')
     kill_proc('tdctl')
 
     _, exec_file = os.path.split(__file__)
@@ -133,15 +139,21 @@ def prepare_db(basedir, dbsize, dbnum, options):
     kill_proc(exec_file, self_pid)
 
     if 'skip_db_recreation' in options:
-        log.info('Skipping database recreation.')
+        log.info('Skipping database recreation but waiting 40 seconds before restart the instances.')
+        time.sleep(40)  # wait for mysqld zombie process to quit completely
     else:
         log.info('Removing database.')
         remove_db(basedir)
         log.info('Creating database.')
-        create_db(basedir, dbsize, dbnum)
+        create_db(basedir, dbnum, tarball)
 
 
 def start_db(dbnum):
+    """
+    Start the database instances and check the logs. This function should only be run after prepare_db()
+    :param dbnum:
+    :return:
+    """
     assert dbnum is not None
     startdb_cmd = 'mysqld_multi start {}'.format(','.join([str(x) for x in range(1, dbnum + 1)]))
     log.info('Starting db: {}'.format(startdb_cmd))
@@ -162,28 +174,31 @@ def start_db(dbnum):
 
 
 def parse_args():
+    """
+    Parse command line parameters
+    :return:
+    """
     parser = argparse.ArgumentParser(
         description="The program to prepare database environment for sysbench test.")
 
-    parser.add_argument("size", help="the database size in GB", type=int)
     parser.add_argument("num", help="the number of database instances", type=int)
 
     parser.add_argument("-v", help="detailed print( -v: info, -vv: debug)",
                         action='count', default=0)
     parser.add_argument("-d", help="the MySQL base directory", default='/var/lib/mysql')
+    parser.add_argument("-z", help="the path of database backup file")
     parser.add_argument("-p",
                         help="parameters(no spaces before and after =): "
                              "'track_active=\"38\" mysql_innodb_buffer_pool_size=\"10240M\"' ",
                         default='')
     parser.add_argument("-o", nargs='*', help="supported options: skip_db_recreation")
 
-
     args = parser.parse_args()
 
     sys_args = dict(item.split('=') for item in args.p.split())
 
     log.debug('Found options: {}'.format(args.o))
-    return args.v, args.d, args.size, args.num, sys_args, args.o
+    return args.v, args.d, args.num, sys_args, args.o, args.z
 
 
 def set_track_active(args):
@@ -197,12 +212,12 @@ def set_track_active(args):
     # Check if dmx is running.
     bf_mod = check_output("lsmod | awk '{print $1}'| grep bf", shell=True).decode('utf-8').rstrip()
     if bf_mod != 'bf':
-        log.error('bf module is not loaded: {}.'.format(bf_mod))
+        log.error('bf module is not loaded: {} - try load-driver and start-bf.'.format(bf_mod))
         raise RuntimeError('Seems that the bf is not loaded.')
 
     # Set track active and mysql config file
     track_active = args.get('track_active', '0')
-    log.info('Set track active to {}'.format(track_active))
+    # log.info('Set track active to {}'.format(track_active))
 
     if track_active != '0':
         try:
@@ -212,14 +227,14 @@ def set_track_active(args):
         # Set track active
         set_ta_cmd = 'memcli process settings --set-max {}'.format(track_active)
         ret = check_output(set_ta_cmd, shell=True, stderr=STDOUT)
-        log.debug('Set result: {}'.format(ret.decode('utf-8').strip()))
+        log.debug('Set track active to {}'.format(ret.decode('utf-8').strip()))
     else:
         # 0 or None means DMX should be disabled, I'll remove /dmx/etc/bfapp.d/mysqld here.
         try:
-            os.remove('/dmx/etc/bfapp.d/mysqld')
+            shutil.move('/dmx/etc/bfapp.d/mysqld', '/dmx/etc/bfapp.d/bak.mysqld')
         except FileNotFoundError:
             pass
-        log.info('Track active=0, bfapp.d/mysqld removed.')
+        log.info('Set track active to 0, bfapp.d/mysqld gets renamed.')
 
 
 def set_mysql_cnf(args):
@@ -278,10 +293,10 @@ def trans_log_level(level_int=1):
 
 
 if __name__ == "__main__":
-    log_level, base_dir, db_size, db_num, sys_args, options = parse_args()
+    log_level, base_dir, db_num, sys_args, options, tarball = parse_args()
     # Set the log level of this module
-    logging.basicConfig(level=trans_log_level(log_level))
+    logging.basicConfig(level=trans_log_level(log_level), format='%(levelname)s: %(message)s')
 
     prepare_sys(sys_args)
-    prepare_db(base_dir, db_size, db_num, options)
+    prepare_db(base_dir, db_num, tarball, options)
     start_db(db_num)

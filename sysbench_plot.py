@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 A helper program to parse the sysbench logs and plot graphs.
+Written ugly by @Eric Yang
 Usage:
     ./sysbench_plot.py -p prefix log_file(s)
 """
@@ -10,6 +11,8 @@ import os
 import argparse
 import numpy as np
 import matplotlib
+# Force matplotlib to not use any Xwindows backend.
+matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
 
@@ -43,17 +46,60 @@ def parse_log(log_file, log_type):
                 'tdctl': r'^[\d.]+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)[\s-]+(\w*)'
                 }
 
-    ptn = re.compile(ptn_list.get(log_type))
+    ptn = ptn_list.get(log_type)
 
-    try:
-        with open(log_file) as log:
-            for line in log:
-                match = ptn.findall(line)
-                if len(match) > 0:
-                    yield match[0]
-    except FileNotFoundError as e:
-        print(e)
-        raise
+    if ptn:  # Parsed with re
+        ptn = re.compile(ptn)
+        try:
+            with open(log_file) as log:
+                for line in log:
+                    match = ptn.findall(line)
+                    if len(match) > 0:
+                        yield match[0]
+        except FileNotFoundError as e:
+            print(e)
+            raise
+    else:  # Parsed by customized functions
+        if log_type == 'innodb':
+            yield from parse_innodb_status(log_file)
+        else:
+            print('Unsupported log type: {}'.format(log_file))
+            return
+
+
+def parse_innodb_status(log_file):
+    """
+    This function parses log files of 'show engine innodb status' to extract information like
+    checkpoint lag, dirty buffer ratio, etc.
+    :param log_file:
+    :return:
+    """
+    current_lsn = 0
+    log_flushed_lsn = 0
+    page_flushed_lsn = 0
+    checkpoint_lsn = 0
+    dirty_pages = 0
+
+    with open(log_file) as file:
+        for line in file:
+            if line.startswith('Log sequence number'):
+                current_lsn = float(line.split()[3])
+            elif line.startswith('Log flushed up to'):
+                log_flushed_lsn = float(line.split()[4])
+            elif line.startswith('Pages flushed up to'):
+                page_flushed_lsn = float(line.split()[4])
+            elif line.startswith('Last checkpoint at'):
+                checkpoint_lsn = float(line.split()[3])
+            elif line.startswith('Modified db pages'):
+                dirty_pages = float(line.split()[3])
+
+            elif line.startswith('END OF INNODB MONITOR OUTPUT'):
+                log_flush_lag = current_lsn - log_flushed_lsn
+                page_flush_lag = current_lsn - page_flushed_lsn
+                checkpoint_lag = current_lsn - checkpoint_lsn
+                yield (log_flush_lag, page_flush_lag, checkpoint_lag, dirty_pages)
+            else:
+                pass
 
 
 def plot(p_type, data, plotfile, pre=''):
@@ -67,9 +113,62 @@ def plot(p_type, data, plotfile, pre=''):
         plot_vmstat(data, plotfile, pre)
     elif p_type == 'tdctl':
         plot_tdctl(data, plotfile, pre)
+    elif p_type == 'innodb':
+        plot_innodb(data, plotfile, pre)
     else:
         print('Skipping: {}'.format(p_type))
         pass
+
+
+def plot_innodb(data, plotfile, prefix):
+    """
+    This function plots the data extracted from innodb_status_dbx.log
+    :param data:
+    :param plotfile:
+    :param prefix:
+    :return:
+    """
+    # The data is (log_flush_lag, page_flush_lag, checkpoint_lag, dirty_pages)
+    try:
+        log_flush_lag, page_flush_lag, checkpoint_lag, dirty_pages = list(zip(*data))
+    except ValueError as e:
+        print(e)
+        raise
+
+    sec = [60*x for x in range(len(log_flush_lag))]
+    sec_max = sec[-1]
+
+    lag_max = max(log_flush_lag, page_flush_lag, checkpoint_lag)
+    dirty_pages_max = max(dirty_pages)
+
+    matplotlib.rcParams.update({'font.size': 10})
+
+    plt.subplot(211)
+    plt.plot(sec, log_flush_lag, label='Log flush lag')
+    plt.plot(sec, page_flush_lag, label='Dirty page flush lag')
+    plt.plot(sec, checkpoint_lag, label='Checkpoint lag')
+    _, name_with_ext = os.path.split(plotfile)
+    title_desc, _ = os.path.splitext(name_with_ext)
+
+    plt.title('LSN lag({}/{})'.format(prefix, title_desc),
+              fontsize=10, fontweight='bold')
+    plt.ylabel('LSN lag')
+    plt.xlim([0, sec_max])
+    plt.legend(fontsize=8, loc='best')
+    plt.grid(True)
+
+    plt.subplot(212)
+    plt.plot(sec, dirty_pages, label='Dirty pages')
+    plt.title('Buffer pool dirty pages', fontsize=10, fontweight='bold')
+    plt.xlim([0, sec_max])
+    plt.ylabel('pages')
+    plt.ylim([0, dirty_pages_max])
+    plt.legend(fontsize=8, loc='best')
+    plt.grid(True)
+
+    plt.xlabel('seconds')
+    plt.savefig(plotfile)
+    plt.close()
 
 
 def plot_tdctl(data, plotfile, prefix):
@@ -189,11 +288,13 @@ def plot_tdctl(data, plotfile, prefix):
 
 
 def plot_vmstat(data, plotfile, prefix):
-    assert data is not None
     matplotlib.rcParams.update({'font.size': 60})
     plt.figure(figsize=(100, 60))
-
     vmstat_data = list(zip(*data))
+
+    if not vmstat_data:
+        return
+
     metrics = ['r', 'b',
                'swpd', 'free', 'buff', 'cache',
                'si', 'so',
@@ -374,7 +475,10 @@ def plot_sb(data, plotfile, prefix):
 
     plt.subplot(211)
     plt.plot(sec, tps)
-    plt.title('TPS({}) (max={}, avg={:.2f})'.format(prefix + plotfile.split('.')[0], tps_max, tps_avg),
+    _, name_with_ext = os.path.split(plotfile)
+    title_desc, _ = os.path.splitext(name_with_ext)
+
+    plt.title('TPS({}/{}) (max={}, avg={:.2f})'.format(prefix, title_desc, tps_max, tps_avg),
               fontsize=10, fontweight='bold')
     plt.ylabel('tps')
     plt.xlim([0, sec_max])
@@ -408,8 +512,10 @@ if __name__ == '__main__':
     title_prefix = args.p
 
     for file_name in logfile_names:
+        # [Hard-coded]the first part of the log file name is the type
         plot_type = os.path.basename(file_name).split('_')[0]
         log_data = parse_log(file_name, plot_type)
+
         plot_file = file_name.split('.')[0] + '.png'
 
         plot(plot_type, log_data, plot_file, title_prefix)
