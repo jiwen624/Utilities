@@ -16,7 +16,8 @@
                                               --@EricYang v0.62 Aug 24, 2016
     4. Added 'mysql_base_dir' to the .cnf file --@EricYang v0.63 Aug 27, 2016
     5. Added logs of show engine innodb status --@EricYang v0.64 Sep 01, 2016
-    6. Fixed a few bugs.                       --@EricYang v0.65 Sep 03, 2016
+    6. Fixed a few bugs.
+       Added 'tar_strips_components' to the .cnf file --@EricYang v0.65 Sep 03, 2016
 """
 import os
 import re
@@ -58,6 +59,7 @@ class Sweep:
             self._db_port = cnf.get('server', 'db_port')
             self._client_ip = cnf.get('server', 'client_ip')
             self._dbscript_path = cnf.get('server', 'dbscript_path')
+            self.login_user = cnf.get('server', 'dbserver_user')
 
             # section: benchmark
             tmp_log_dir, _ = os.path.splitext(self._cnf_file)
@@ -69,8 +71,10 @@ class Sweep:
             # self._db_size = cnf.get('benchmark', 'db_size').rstrip('G')
             self._lua_script = cnf.get('benchmark', 'lua_script')
             self._tarball_path = cnf.get('benchmark', 'tarball_path')
+            self._tar_strips = cnf.get('benchmark', 'tar_strip_components')
             # self._tblsize = self._get_table_size()
             # self._tblnum = self._get_table_num()
+            self._db_name = cnf.get('benchmark', 'db_name')
             self._tblsize = cnf.get('benchmark', 'table_rows')
             self._tblnum = cnf.get('benchmark', 'table_num')
             self._base_dir = cnf.get('benchmark', 'mysql_base_dir')
@@ -108,16 +112,33 @@ class Sweep:
                     raise ValueError('Invalid email address in *mail_recipients*')
 
             self._sweep_logs = []
-            self._user = cnf.get('misc', 'user')
             self._ssd_device = cnf.get('misc', 'ssd_device')
             self._skip_db_recreation = True if cnf.get('misc', 'skip_db_recreation') == 'true' else False
             log.debug('Sweep config file: {} loaded.'.format(config_file))
             self._running_procs = []
             self._original_sigint = None
+            # paramiko Transport object
+            self._trans = None
 
         except (NoSectionError, NoOptionError, KeyError, ValueError):
             log.error('Invalid config file or unsupported option:{}'.format(config_file))
             raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def close(self):
+        """
+        close:
+            - kill all processes which are still running
+            - close transport to database server
+        :return:
+        """
+        self.kill_running_procs()
+        self.close_db_conn()
 
     @property
     def original_sigint(self):
@@ -172,21 +193,39 @@ class Sweep:
         """
         assert cmd
         log.info('[db] {}'.format(cmd))
+        # Reuse the Transport object if there is already there.
+        if self._trans is None:
+            self._trans = paramiko.Transport(self._db_ip, 22)
 
-        trans = paramiko.Transport(self._db_ip, 22)
-        key_path = os.path.expanduser('~/.ssh/id_rsa')
-        key = paramiko.RSAKey.from_private_key_file(key_path)
-        trans.connect(username=self._user, pkey=key)
-        session = trans.open_channel("session")
+        # Reconnect to remote server if the connection is inactive.
+        if not self._trans.is_active():
+            key_path = os.path.expanduser('~/.ssh/id_rsa')
+            key = paramiko.RSAKey.from_private_key_file(key_path)
+            self._trans.connect(username=self.login_user, pkey=key)
+
+        # Each command needs a separate session
+        session = self._trans.open_channel("session")
         session.exec_command(cmd)
 
         result = ''
+        # Check remote command status and get the real-time output.
         while not session.exit_status_ready():
             if session.recv_ready():
                 buff = session.recv(4096).decode('utf-8').strip()
                 log.info('[db] {}'.format(buff))
                 result += buff
-        return result + '\n'
+        # The session needs to be closed
+        session.close()
+        return result + '\n'  # The '\n' was striped.
+
+    def close_db_conn(self):
+        """
+        Close the Transport object to the database server
+        :return:
+        """
+        if self._trans:
+            self._trans.close()
+            self._trans = None
 
     # def _run_remote(self, cmd):
     #     """
@@ -288,7 +327,7 @@ class Sweep:
         watcher.join(timeout=10)
 
     def kill_running_procs(self):
-        log.info('[client] Timeout! Commands still running will be killed.')
+        log.info('[client] ALL commands still running will be killed:')
         procs = self._running_procs
         self._running_procs = []
 
@@ -318,12 +357,13 @@ class Sweep:
 
         skip_db_recreation = '-o skip_db_recreation' if self._skip_db_recreation else ''
         cmd_template = '{cleanup_script} {db_num} {skip_db_recreation} ' \
-                       '-d {base_dir} -z {tarball} -v -p "{parameters}" 2>&1'
+                       '-d {base_dir} -z {tarball} -s {strips} -v -p "{parameters}" 2>&1'
         clean_db_cmd = cmd_template.format(cleanup_script=cleanup_script,
                                            db_num=self._db_num,
                                            skip_db_recreation=skip_db_recreation,
                                            base_dir=self._base_dir,
                                            tarball=self._tarball_path,
+                                           strips=self._tar_strips,
                                            parameters=self._db_parms,
                                            log_path=self._dbscript_path)
         self.db_cmd(clean_db_cmd)
@@ -346,10 +386,13 @@ class Sweep:
 
         for proc in psutil.process_iter():
             for name in proc_names:
-                if name in ' '.join(proc.cmdline()) and proc.pid != skip_pid:
-                    log.debug('Killing process:({}) {}'.format(proc.pid, ' '.join(proc.cmdline())))
-                    proc.kill()
-                    continue
+                try:
+                    if name in ' '.join(proc.cmdline()) and proc.pid != skip_pid:
+                        log.debug('Killing process:({}) {}'.format(proc.pid, ' '.join(proc.cmdline())))
+                        proc.kill()
+                        continue
+                except psutil.NoSuchProcess:
+                    pass
 
     def clean_client(self):
         """
@@ -373,20 +416,20 @@ class Sweep:
         self.kill_proc_by_name(exec_file, self_pid)
 
         time.sleep(5)
-        log.info('Client is ready.')
+        log.info('[client] ***Client is ready.***')
 
-    def run_one_test(self, thread_num):
+    def run_one_test(self, thread_cnt):
         """
         Run a benchmark with sysbench thread number=thread_num
         - and may plot and compress them.
         - and send an email.
-        :param thread_num:
+        :param thread_cnt:
         :return:
         """
-        assert thread_num is not None
+        assert thread_cnt is not None
 
-        log.info('Running test of {} sysbench threads'.format(thread_num))
-        current_log_files = []  # Record the file names of all current logs.
+        log.info('Running test of {} sysbench threads'.format(thread_cnt))
+        curr_logs = []  # Record the file names of all current logs.
         all_cmds = []  # All the commands need to be executed
 
         cmd_template = 'sysbench ' \
@@ -395,7 +438,7 @@ class Sweep:
                        '--oltp-tables-count={oltp_tables_count} ' \
                        '--mysql-host={mysql_host} ' \
                        '--mysql-port={mysql_port} ' \
-                       '--mysql-db=sbtest ' \
+                       '--mysql-db={db_name} ' \
                        '--mysql-user=sbtest ' \
                        '--mysql-password=sbtest ' \
                        '--num-threads={thread_num} ' \
@@ -417,17 +460,18 @@ class Sweep:
             db_idx = port - int(self._db_port) + 1
             # For each instance, record sysbench logs and innodb status logs, etc.
             # 1. the sysbench logs:
-            sb_logfile_tail = 'sb_{}_{}_db{}.log'.format(self._target,
-                                                         thread_num,
-                                                         db_idx)
-            sb_log_file = os.path.join(self._log_dir, sb_logfile_tail)
+            sb_log_fname = 'sb_{}_{}_db{}.log'.format(self._target,
+                                                      thread_cnt,
+                                                      db_idx)
+            sb_log = os.path.join(self._log_dir, sb_log_fname)
 
             sb_cmd = cmd_template.format(lua_script=self._lua_script,
                                          oltp_table_size=self._tblsize,
                                          oltp_tables_count=self._tblnum,
                                          mysql_host=self._db_ip,
                                          mysql_port=port,
-                                         thread_num=thread_num,
+                                         db_name=self._db_name,
+                                         thread_num=thread_cnt,
                                          max_time=self._duration,
                                          oltp_read_only='on' if self._read_only else 'off',
                                          oltp_point_selects=self._point_selects,
@@ -437,26 +481,27 @@ class Sweep:
                                          oltp_distinct_ranges=self._distinct_ranges,
                                          oltp_index_updates=self._index_updates,
                                          oltp_non_index_updates=self._non_index_updates,
-                                         file_name=sb_log_file)
+                                         file_name=sb_log)
             all_cmds.append(sb_cmd)
-            current_log_files.append(sb_log_file)
+            curr_logs.append(sb_log)
 
             # 2. the innodb status logs - every 60 seconds:
-            innodb_logfile_tail = 'innodb_status_db{}.log'.format(db_idx)
-            innodb_logfile = os.path.join(self._log_dir, innodb_logfile_tail)
-            innodb_cmd_template = "while true; " \
-                                  "do " \
-                                  "  (mysql -S {socket_prefix}{db_idx} -e " \
-                                  "'     show engine innodb status\G' | " \
-                                  "  grep -A 28 -E 'LOG|END OF INNODB MONITOR OUTPUT'&); " \
-                                  "  sleep 60; " \
-                                  "done".format(socket_prefix=self._socket_prefix,
-                                                db_idx=db_idx)
-            innodb_cmd = 'ssh root@{server_ip} "{cmd}" &> {innodb_logfile}'.format(server_ip=self._db_ip,
-                                                                                   cmd=innodb_cmd_template,
-                                                                                   innodb_logfile=innodb_logfile)
+            innodb_fname = 'innodb_status_db{}.log'.format(db_idx)
+            innodb_log = os.path.join(self._log_dir, innodb_fname)
+            innodb_cmd_tmp = "while true; " \
+                             "do " \
+                             "  (mysql -S {socket_prefix}{db_idx} -e " \
+                             "'     show engine innodb status\G' | " \
+                             "  grep -A 28 -E 'LOG|END OF INNODB MONITOR OUTPUT'&); " \
+                             "  sleep 60; " \
+                             "done".format(socket_prefix=self._socket_prefix,
+                                           db_idx=db_idx)
+            innodb_cmd = 'ssh -t root@{server_ip} ' \
+                         '"{cmd}" &> {innodb_log}'.format(server_ip=self._db_ip,
+                                                          cmd=innodb_cmd_tmp,
+                                                          innodb_log=innodb_log)
             all_cmds.append(innodb_cmd)
-            current_log_files.append(innodb_logfile)
+            curr_logs.append(innodb_log)
 
         # Commands for system monitoring.
         os_cmds = ('iostat -dmx {} -y'.format(self._ssd_device),
@@ -464,18 +509,20 @@ class Sweep:
                    'vmstat -S M -w',
                    'tdctl -v --dp +')
         for cmd in os_cmds:
-            sys_log_file = os.path.join(self._log_dir, '{}_{}_{}.log'.format(cmd.split()[0], self._target, thread_num))
+            sys_log = os.path.join(self._log_dir,
+                                   '{}_{}_{}.log'.format(cmd.split()[0], self._target, thread_cnt))
             count = '' if 'tdctl' in cmd else int(self._duration / 10)
-            sys_mon_cmd = 'ssh root@{server_ip} "{cmd} 10 {count}" > {log_name}'.format(server_ip=self._db_ip,
-                                                                                        cmd=cmd,
-                                                                                        count=count,
-                                                                                        log_name=sys_log_file)
-            all_cmds.append(sys_mon_cmd)
-            current_log_files.append(sys_log_file)
+            sysmon_cmd = 'ssh -t root@{server_ip} ' \
+                         '"{cmd} 10 {count}" > {log_name}'.format(server_ip=self._db_ip,
+                                                                  cmd=cmd,
+                                                                  count=count,
+                                                                  log_name=sys_log)
+            all_cmds.append(sysmon_cmd)
+            curr_logs.append(sys_log)
 
         self.client_cmd(all_cmds, self._duration + 60)
-        self._sweep_logs.extend(current_log_files)
-        return current_log_files
+        self._sweep_logs.extend(curr_logs)
+        return curr_logs
 
     def plot(self):
         """
@@ -528,16 +575,16 @@ class Sweep:
         self.client_cmd(sendmail_cmd, timeout=600)
 
     @staticmethod
-    def result_is_good(current_log_files):
+    def result_is_good(curr_logs):
         """
         Check if the benchmark has been done successfully and raise an RuntimeError if some error happens.
         It's considered good if the sb_*.log (sysbench logs) contains 'execution time' in the tail.
-        :param current_log_files:
+        :param curr_logs:
         :return:
         """
         log.info('Checking if the sweep is in good state.')
-        assert current_log_files
-        for file in current_log_files:
+        assert curr_logs
+        for file in curr_logs:
             _, tail = os.path.split(file)
             if tail.startswith('sb'):
                 check_cmd = "tail -2 {} | awk '{{print $1, $2}}'".format(file)
@@ -550,9 +597,9 @@ class Sweep:
     def cat_db_file(self, remote_file, local_file):
         """Inner function to cat db files from remote server
         """
-        self.get_db_cnf_from_cmd('cat {}'.format(remote_file), local_file)
+        self.get_db_cnf_by_cmd('cat {}'.format(remote_file), local_file)
 
-    def get_db_cnf_from_cmd(self, cmd, local_file):
+    def get_db_cnf_by_cmd(self, cmd, local_file):
         """Inner function to get database config from a specific command
         """
         local_file = os.path.join(self._log_dir, local_file)
@@ -601,18 +648,18 @@ class Sweep:
         self.cat_db_file('/dmx/etc/bfcs.d/mysqld', 'bfcsd.mysqld')
 
         # Get the database server configurations and write to a log file
-        self.get_db_cnf_from_cmd('barf --dv', 'barf.out')
-        self.get_db_cnf_from_cmd('barf -v -l', 'barf.out')
-        self.get_db_cnf_from_cmd('lscpu', 'server_os_info.out')
-        self.get_db_cnf_from_cmd('free', 'server_os_info.out')
+        self.get_db_cnf_by_cmd('barf --dv', 'barf.out')
+        self.get_db_cnf_by_cmd('barf -v -l', 'barf.out')
+        self.get_db_cnf_by_cmd('lscpu', 'server_os_info.out')
+        self.get_db_cnf_by_cmd('free', 'server_os_info.out')
 
         if self._send_mail:
             self.send_mail()
 
         # Change the .cnf file to .done
         try:
-            pure_filename, _ = os.path.splitext(self._cnf_file)
-            os.rename(self._cnf_file, pure_filename + '.done')
+            pure_fname, _ = os.path.splitext(self._cnf_file)
+            os.rename(self._cnf_file, pure_fname + '.done')
         except (OSError, FileExistsError) as e:
             log.warning('Failed to rename the config file: {}'.format(e))
 
@@ -638,13 +685,13 @@ if __name__ == "__main__":
     # I don't want to see paramiko debug logs, unless they are WARNING or worse than that.
     logging.getLogger("paramiko").setLevel(logging.WARNING)
 
-    log.info('****New sweep config file found, preparing to start.****')
-    sweep = Sweep(args.config)
-    try:
-        sweep.start()
-        log.info('The sweep has finished. Bye.')
-    except KeyboardInterrupt:
-        log.warning('Received SIGINT. I will kill the running processes')
-        for process in sweep.running_procs:
-            process.kill()
+    log.info('******New sweep config file found, preparing to start.******')
+    with Sweep(args.config) as sweep:
+        try:
+            sweep.start()
+            log.info('The sweep has finished. Bye.')
+        except KeyboardInterrupt:
+            log.warning('Received SIGINT. I will kill the running processes')
+            # run clean-up of the sweep object
+            sweep.close()
     sys.exit(0)
