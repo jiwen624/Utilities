@@ -292,7 +292,7 @@ class Sweep:
         self._running_procs = [Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE,
                                      universal_newlines=True, close_fds=True,
                                      preexec_fn=os.setsid) for cmd in commands]
-        watcher = threading.Timer(timeout, self.kill_running_procs)
+        watcher = threading.Timer(timeout, self.sweep_timeout_handler)
         watcher.start()
         p = select.epoll()
         pipe_dict = {}
@@ -341,6 +341,14 @@ class Sweep:
         # We need to cancel the watcher here as we don't need it any more.
         watcher.cancel()
         watcher.join(timeout=10)
+
+    def sweep_timeout_handler(self):
+        """
+        The timeout handler for the sweep. It will be invoked when the designated time has passed.
+        :return:
+        """
+        log.info('Shutdown the sweep as it reaches its time limit: {}'.format(self._duration))
+        self.kill_running_procs()
 
     def kill_running_procs(self):
         log.info('[client] Cleaning up the sweep. ALL commands still running will be killed:')
