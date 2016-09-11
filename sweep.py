@@ -119,6 +119,7 @@ class Sweep:
             self._skip_db_recreation = True if cnf.get('misc', 'skip_db_recreation') == 'true' else False
             log.debug('Sweep config file: {} loaded.'.format(config_file))
             self._running_procs = []
+            self._watchers = []
             self._original_sigint = None
             # paramiko Transport object
             self._trans = None
@@ -229,7 +230,8 @@ class Sweep:
         while True:
             if session.recv_ready():
                 buff = session.recv(4096).decode('utf-8').strip().replace('\r', '')
-                log.info('[db] {}'.format(buff))
+                for line in buff.split('\n'):
+                    log.info('[db] {}'.format(line))
                 result += buff
             # We can break out if there is no buffered data and the process has exited.
             elif session.exit_status_ready():
@@ -299,6 +301,7 @@ class Sweep:
                                preexec_fn=os.setsid) for cmd in commands]
         self._running_procs.extend(running_procs)
         watcher = threading.Timer(timeout, self.sweep_timeout_handler)
+        self._watchers.append(watcher)
         watcher.start()
         p = select.epoll()
         pipe_dict = {}
@@ -307,7 +310,7 @@ class Sweep:
             p.register(proc.stdout, select.POLLIN | select.POLLERR | select.POLLHUP)
             stdout_fileno = proc.stdout.fileno()
             pipe_dict[stdout_fileno] = proc.stdout
-            # log.info('[client] (id:{}) cmd=({})'.format(stdout_fileno, proc.args))
+            log.info('[client] (pid:{}) cmd=({})'.format(proc.pid, proc.args))
 
         # Check the output of commands in real-time and poll the status of command:
         #       1. Finished (Done|Failed) 2. Still running.
@@ -345,7 +348,8 @@ class Sweep:
                         # Check if sysbench is failed and do fast-fail if so:
                         if 'sysbench' in proc.args:  # sysbench failure is a critical error.
                             log.error('[client] Fatal error found in sysbench, exiting...')
-                            watcher.cancel()
+                            # watcher.cancel()  ->all the watchers will be canceled in self.close()
+
                             self.copy_mysql_logs()
                             self.close()
                             # Clean the running process list to quit the loop,
@@ -368,6 +372,11 @@ class Sweep:
                     # So we check the next command in the running_procs list.
                     continue
         # Just cancel the watcher here as everything is done before timeout.
+        try:
+            self._watchers.remove(watcher)
+        except ValueError:
+            pass
+
         watcher.cancel()
         watcher.join()
 
@@ -392,12 +401,17 @@ class Sweep:
         :return:
         """
         log.info('Stop the sweep for reaching the limit: {} sec'.format(self._duration))
-        self.run_client_cmd('sync;sleep 10', timeout=60)
         self.kill_running_procs()
 
     def kill_running_procs(self):
         procs = self._running_procs
         self._running_procs = []
+
+        watchers = self._watchers
+        self._watchers = []
+
+        for watcher in watchers:
+            watcher.cancel()
 
         for proc in procs:
             # log.debug('[client] Killing: ({}) {}.'.format(proc.pid, proc.args))
@@ -582,19 +596,18 @@ class Sweep:
             # 2. The innodb status logs - every 60 seconds------------------------------
             innodb_log_name = 'innodb_status_db{}.log'.format(db_idx)
             innodb_log_path = os.path.join(self._log_dir, innodb_log_name)
-            innodb_cmd_tmp = "while true; " \
-                             "do " \
-                             "  (mysql -S {socket_prefix}{db_idx} -e " \
-                             "'     show engine innodb status\G' | " \
-                             "  grep -A 28 -E 'LOG|END OF INNODB MONITOR OUTPUT'&); " \
-                             "  sleep 60; " \
-                             "done".format(socket_prefix=self._socket_prefix,
-                                           db_idx=db_idx)
-            innodb_cmd = 'ssh {user}@{server_ip} ' \
-                         '"{cmd}" &> {log_name}'.format(user=self._login_user,
-                                                        server_ip=self._db_ip,
-                                                        cmd=innodb_cmd_tmp,
-                                                        log_name=innodb_log_path)
+            innodb_cmd = "while true; " \
+                         "do " \
+                         "ssh {user}@{server_ip} \"mysql -S {socket_prefix}{db_idx} -e " \
+                         "'show engine innodb status\G' | " \
+                         "  grep -A 28 -E 'LOG|MONITOR'\" &>> {log_name}; " \
+                         "  sleep 60; " \
+                         "done".format(user=self._login_user,
+                                       server_ip=self._db_ip,
+                                       socket_prefix=self._socket_prefix,
+                                       db_idx=db_idx,
+                                       log_name=innodb_log_path)
+
             all_cmds.append(innodb_cmd)
             curr_logs.append(innodb_log_path)
 
@@ -659,7 +672,7 @@ class Sweep:
         all_cmds.append(barf_act_algo_cmd)
         curr_logs.append(barf_act_algo_log_path)
 
-        # 6. The dmx monitoring logs: barf -a --ct bf - every 10 seconds---------------------
+        # 7. The dmx monitoring logs: barf -a --ct bf - every 10 seconds---------------------
         barf_act_bf_log_path = os.path.join(self._log_dir, 'barf_a_ct_bf.log')
         barf_act_bf_cmd_tmp = "while true; " \
                               "do" \
@@ -674,7 +687,7 @@ class Sweep:
         all_cmds.append(barf_act_bf_cmd)
         curr_logs.append(barf_act_bf_log_path)
 
-        # 7. The dmx monitoring logs: monitor, every 10 seconds------------------------------
+        # 8. The dmx monitoring logs: monitor, every 10 seconds------------------------------
         pids = self.get_database_pid()
         for idx, pid in enumerate(pids, 1):
             if not pid:
@@ -689,7 +702,7 @@ class Sweep:
             all_cmds.append(monitor_full_cmd)
             curr_logs.append(monitor_log_path)
 
-        # 8. Shoot the commands out------------------------------------------------------
+        # 9. Shoot the commands out------------------------------------------------------
         # Allow 300 seconds more time to let the commands quit by themselves.
         self.run_client_cmd(all_cmds, self._duration + 180)
         self._sweep_logs.extend(curr_logs)
@@ -915,7 +928,8 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=log_level,
                         stream=sys.stdout,
-                        format='%(asctime)s %(levelname)s: %(message)s')
+                        format='%(asctime)s %(levelname)s: %(message)s',
+                        datefmt='%m-%d %H:%M:%S')
     # I don't want to see paramiko debug logs, unless they are WARNING or worse than that.
     logging.getLogger("paramiko").setLevel(logging.WARNING)
 
