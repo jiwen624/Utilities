@@ -946,11 +946,11 @@ if __name__ == "__main__":
                 log.error('The sweep has failed.')
         except KeyboardInterrupt:
             # We cannot use logging here as the pipe is already broken
-            print('Received SIGINT. I will kill the running processes')
-            # run clean-up of the sweep object
-            sweep.close()
+            print('Ctrl-C pressed by user. I will kill the running processes')
+            # the sweep.close() will be executed automatically.
+            # sweep.close()
         except SweepFatalError:
             print('Fatal error. See above error messages.')
-            sweep.close()
+            # sweep.close()
 
     sys.exit(0)
