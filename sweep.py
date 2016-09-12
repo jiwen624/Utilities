@@ -883,15 +883,15 @@ if __name__ == "__main__":
     log.info('------New sweep config file found, preparing to start------')
     log.info('-----------------------------------------------------------')
 
+    status = 'unknown'
     with Sweep(args.config) as sweep:
         try:
             sweep.start()
-            if sweep.successful:
-                log.info('The sweep has finished. Bye.')
-            else:
-                log.error('The sweep has failed.')
+            status = 'finished' if sweep.successful else 'failed'
+
         except KeyboardInterrupt:
             # We cannot use logging here as the pipe is already broken
+            status = 'canceled'
             print('Ctrl-C pressed by user. I will kill the running processes')
             try:
                 os.rename(sweep.log_dir, sweep.log_dir + '_CANCELED')
@@ -899,7 +899,9 @@ if __name__ == "__main__":
                 pass
 
         except SweepFatalError:
+            status = 'failed'
             print('Fatal error. See above error messages.')
             # sweep.close()
 
+    log.info('The sweep is {}. Bye.'.format(status))
     sys.exit(0)
