@@ -20,6 +20,8 @@
        Added 'tar_strips_components' to the .cnf file --@EricYang v0.65 Sep 03, 2016
     7. A few enhancements and bug fixes.       --@EricYang v0.65 Sep 09, 2016
     8. Fixed a major bug: the _run_loal() should be reentrant.  --@EricYang v0.66 Sep10, 2016
+    9. Used time comparison instead of the timer in _run_local()
+       Fxied a bug of the code using epoll                      --@EricYang v0.67 Sep12, 2016
 """
 import os
 import re
@@ -248,73 +250,82 @@ class Sweep:
         self.all_running_procs.extend(running_procs)
         start = time.time()
 
-        p = select.epoll()
-        pipe_dict = {}
+        # Use context management to close epoll object in the end.
+        with select.epoll() as p:
+            pipe_dict = {}
 
-        for proc in running_procs:
-            p.register(proc.stdout, select.POLLIN | select.POLLERR | select.POLLHUP)
-            stdout_fileno = proc.stdout.fileno()
-            pipe_dict[stdout_fileno] = proc.stdout
-            log.info('[client] (pid:{}) cmd=({})'.format(proc.pid, proc.args))
-
-        # Check the output of commands in real-time and poll the status of command:
-        #       1. Finished (Done|Failed) 2. Still running.
-        # Remove the process if it has finished so the loop will exit when no process is running.
-        while running_procs and (time.time() - start) < timeout:
-            # Get the processes list which have printed something.
-            result = p.poll(timeout=1) # The timeout is in seconds, not milliseconds!
-            if len(result):
-                # result --> a list of processes structs
-                # m[0] --> file_no of the stdout of that process, the stderr is also redirected to PIPE
-                # m[1] --> signal
-                for m in result:
-                    if m[1] & select.POLLIN:
-                        log.debug('[client] (id:{}) {}'.format(m[0], pipe_dict[m[0]].readline().strip()))
-
-            # Check the running status of the processes.
             for proc in running_procs:
-                ret = proc.poll()
-                if ret is not None:  # Process finished.
-                    # Remove finished process ASAP from local and global lists, as well as epoll list
-                    try:
-                        running_procs.remove(proc)
-                        self.all_running_procs.remove(proc)
-                        p.unregister(proc.stdout)
-                    except ValueError:
-                        pass
+                p.register(proc.stdout, select.POLLIN | select.POLLERR | select.POLLHUP)
+                stdout_fileno = proc.stdout.fileno()
+                pipe_dict[stdout_fileno] = proc.stdout
+                log.info('[client] (pid:{}) cmd=({})'.format(proc.pid, proc.args))
 
-                    _, errors_raw = proc.communicate()
-                    errors = errors_raw.rstrip()
+            # Check the output of commands in real-time and poll the status of command:
+            #       1. Finished (Done|Failed)
+            #       2. Still running.
+            # Remove the process if it has finished so the loop will exit
+            # when no process is running.
+            while running_procs and (time.time() - start) < timeout:
+                # Get the processes list which have printed something.
+                result = p.poll(timeout=1)
+                if len(result):
+                    # result --> a list of processes structs
+                    # m[0]   --> file_no of the stdout of that process.
+                    #            the stderr is also redirected to PIPE
+                    # m[1]   --> signal
+                    for m in result:
+                        if m[1] & select.POLLIN:
+                            out_str = pipe_dict[m[0]].readline().strip()
+                            log.debug('[client] (id:{}) {}'.format(m[0], out_str))
 
-                    if ret != 0:  # Process failed.
-                        log.error('[client] command failed: {}'.format(proc.args))
-                        log.error('[client] (errs={})'.format(errors))
-                        # watcher.cancel()
-
-                        # Check if sysbench is failed and do fast-fail if so:
-                        if 'sysbench' in proc.args:  # sysbench failure is a critical error.
-                            log.error('[client] Fatal error found in sysbench, exiting...')
-
-                            # Clean the running process list to quit the loop,
-                            # as all the processes have been killed in self.close()
-                            running_procs = []
-                            self._sweep_successful = False
-                            # raise RuntimeError
-                        else:  # Just ignore failures from the other commands
-                            #  self._running_procs.remove(proc)
+                # Check the running status of the processes.
+                for proc in running_procs:
+                    ret = proc.poll()
+                    if ret is not None:  # Process finished.
+                        # Remove finished process ASAP from local and global lists,
+                        # as well as epoll list
+                        try:
+                            running_procs.remove(proc)
+                            self.all_running_procs.remove(proc)
+                            p.unregister(proc.stdout)
+                        except ValueError:
                             pass
-                    else:
-                        log.info('[client] Done: (cmd={})'.format(proc.args))
-                        # self._running_procs.remove(proc) -->moved to above
 
-                    # Break out from the inner loop after we found a finished process
-                    # We'll not check the next process here, as we need to check the stdout first.
-                    break
-                else:
-                    # This process is still running.
-                    # So we check the next command in the running_procs list.
-                    continue
-        # Just cancel the watcher here as everything is done before timeout.
+                        _, errors_raw = proc.communicate()
+                        errors = errors_raw.rstrip()
+
+                        if ret != 0:  # Process failed.
+                            log.error('[client] command failed: {}'.format(proc.args))
+                            log.error('[client] (errs={})'.format(errors))
+                            # watcher.cancel()
+
+                            # Check if sysbench is failed and do fast-fail if so:
+                            if 'sysbench' in proc.args:  # sysbench failure is a critical error.
+                                log.error('[client] Fatal error found in sysbench, exiting...')
+
+                                # Clean the running process list to quit the loop,
+                                # as all the processes have been killed in self.close()
+                                running_procs = []
+                                self._sweep_successful = False
+                                # raise RuntimeError
+                            else:  # Just ignore failures from the other commands
+                                #  self._running_procs.remove(proc)
+                                pass
+                        else:
+                            log.info('[client] Done: (cmd={})'.format(proc.args))
+                            # self._running_procs.remove(proc) -->moved to above
+
+                        # Break out from the inner loop after we found a finished process
+                        # We'll not check the next process here, as we need to check the
+                        # stdout first.
+                        break
+                    else:
+                        # This process is still running.
+                        # So we check the next command in the running_procs list.
+                        continue
+        # Kill all the local running processes when the sweep is successfully finished.
+        # When a fatal error happens, the running_procs will be empty here, all the local
+        # processes will be killed outside of this function, when the Sweep object is released.
         for proc in running_procs:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -712,7 +723,8 @@ class Sweep:
             _, tail = os.path.split(file)
             if tail.startswith('sb'):
                 check_cmd = "tail -2 {} | awk '{{print $1, $2}}'".format(file)
-                # The return value of check_output will be a string since universal_newlines is True
+                # The return value of check_output will be a string since
+                # universal_newlines is True
                 started = check_output(check_cmd,
                                        shell=True,
                                        universal_newlines=True).replace("\n", " ")
@@ -759,7 +771,8 @@ class Sweep:
         This function returns a list which contains the pid of all the MySQL processes
         :return:
         """
-        cmd = "grep pid-file /etc/my.cnf | awk -F= '{{print $NF}}' | head -{} | xargs cat".format(self._db_num)
+        cmd = "grep pid-file /etc/my.cnf | awk -F= '{{print $NF}}' " \
+              "| head -{} | xargs cat".format(self._db_num)
         exit_status, pids = self.run_db_cmd(cmd)
         return pids.split('\n')
 
@@ -781,7 +794,7 @@ class Sweep:
         except FileNotFoundError as e:
             log.warning('Sweep config file is gone now! {}'.format(e))
 
-        log.info('Sweep <{}> started, check logs under that directory.'.format(self._log_dir))
+        log.info('Sweep <{}> started, check logs in that directory.'.format(self._log_dir))
 
         self.clean_client()
         self.clean_db()
