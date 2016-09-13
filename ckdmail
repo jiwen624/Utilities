@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+
+import imaplib
+import re
+import colorama
+
+def check_mail(paras):
+    """Check emails
+    """
+    name = paras['name']
+    pwd = paras['pwd']
+    imap_server = paras['imap_server']
+    imap_port = paras['imap_port']
+
+    conn = imaplib.IMAP4_SSL(imap_server, imap_port)
+    conn.login(name, pwd)
+
+    conn.select('INBOX', readonly=True)
+    (ret, msgs) = conn.search(None, '(UNSEEN)')
+
+    if ret == 'OK':
+        for num in msgs[0].decode('utf-8').split():
+            ret, m = conn.fetch(num, '(BODY.PEEK[HEADER])')
+            if ret == 'OK':
+                m = m[0][1].decode('utf-8')
+                header = re.findall('Subject: (.*)\n', m)[0].strip('\r')
+                sender = re.findall('From: (.*)\n', m)[0].strip('\r')
+                print(colorama.Fore.BLUE + header, colorama.Style.RESET_ALL + sender)
+
+
+if __name__ == '__main__':
+    paras = {
+        'name': 'eyang@example.com',
+        'pwd': 'your_password',
+        'imap_server': 'example.com',
+        'imap_port': 993
+    }
+
+    check_mail(paras)
