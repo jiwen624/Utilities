@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ This sweep program is used to run MySQL benchmarks with various configurations
     in client/server. Run this command on the client.
-    External dependencies: sysbench_plot.py, cleandb.py
+    External dependencies: plotter.py, cleandb.py
     
     History:
     0. Initial version created.               -- @EricYang v0.1 March xx, 2016
@@ -81,6 +81,7 @@ class Sweep:
             self._tblnum = cnf.get('benchmark', 'table_num')
             self._base_dir = cnf.get('benchmark', 'mysql_base_dir')
             self._socket_prefix = cnf.get('benchmark', 'mysql_socket_file_prefix')
+            self._sb_poll_interval = cnf.getint('benchmark', 'sysbench_poll_interval', fallback=1)
 
             # section: workload
             self._workload = cnf.get('workload', 'workload_type')
@@ -169,7 +170,7 @@ class Sweep:
     def log_dir(self):
         return self._log_dir
 
-    def _run_remote2(self, cmd):
+    def _run_remote2(self, cmd, suppress=False):
         """
         The new interface to run a command remotely, with the enhancement that
         shows remote output in real time.
@@ -178,7 +179,8 @@ class Sweep:
         :return:
         """
         assert cmd
-        log.info('[db] {}'.format(cmd))
+        if not suppress:
+            log.info('[db] {}'.format(cmd))
         # Reuse the Transport object if there is already there.
         if self._trans is None:
             self._trans = paramiko.Transport(self._db_ip, 22)
@@ -199,8 +201,9 @@ class Sweep:
         while True:
             if session.recv_ready():
                 buff = session.recv(4096).decode('utf-8').strip().replace('\r', '')
-                for line in buff.split('\n'):
-                    log.info('[db] {}'.format(line))
+                if not suppress:
+                    for line in buff.split('\n'):
+                        log.info('[db] {}'.format(line))
                 result += buff
             # We can break out if there is no buffered data and the process has exited.
             elif session.exit_status_ready():
@@ -221,14 +224,15 @@ class Sweep:
             self._trans.close()
             self._trans = None
 
-    def run_db_cmd(self, cmd):
+    def run_db_cmd(self, cmd, suppress=False):
         """
         Run a command remotely on the database server
+        :param suppress:
         :param cmd:
         :return: exit_status
         """
         # return self._run_remote(cmd)
-        return self._run_remote2(cmd)
+        return self._run_remote2(cmd, suppress)
 
     def _run_local(self, commands, timeout):
         """
@@ -241,13 +245,14 @@ class Sweep:
             if isinstance(commands, str):
                 commands = [commands]
             else:
-                log.error("[client] Invalid cmd: {}".format(commands))
+                log.error("Invalid cmd: {}".format(commands))
 
         # shell=True is not the best practice but let's keep it for now.
         running_procs = [Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE,
                                universal_newlines=True, close_fds=True,
                                preexec_fn=os.setsid) for cmd in commands]
         self.all_running_procs.extend(running_procs)
+        _timeout = timeout
         start = time.time()
 
         # Use context management to close epoll object in the end.
@@ -258,14 +263,14 @@ class Sweep:
                 p.register(proc.stdout, select.POLLIN | select.POLLERR | select.POLLHUP)
                 stdout_fileno = proc.stdout.fileno()
                 pipe_dict[stdout_fileno] = proc.stdout
-                log.info('[client] (pid:{}) cmd=({})'.format(proc.pid, proc.args))
+                log.info('(pid:{}) cmd=({})'.format(proc.pid, proc.args))
 
             # Check the output of commands in real-time and poll the status of command:
             #       1. Finished (Done|Failed)
             #       2. Still running.
             # Remove the process if it has finished so the loop will exit
             # when no process is running.
-            while running_procs and (time.time() - start) < timeout:
+            while running_procs and (time.time() - start) < _timeout:
                 # Get the processes list which have printed something.
                 result = p.poll(timeout=1)
                 if len(result):
@@ -273,10 +278,10 @@ class Sweep:
                     # m[0]   --> file_no of the stdout of that process.
                     #            the stderr is also redirected to PIPE
                     # m[1]   --> signal
-                    for m in result:
-                        if m[1] & select.POLLIN:
-                            out_str = pipe_dict[m[0]].readline().strip()
-                            log.debug('[client] (id:{}) {}'.format(m[0], out_str))
+                    for fd, event in result:
+                        if event & select.POLLIN:
+                            out_str = pipe_dict[fd].readline().strip()
+                            log.debug('(id:{}) {}'.format(fd, out_str))
 
                 # Check the running status of the processes.
                 for proc in running_procs:
@@ -295,25 +300,28 @@ class Sweep:
                         errors = errors_raw.rstrip()
 
                         if ret != 0:  # Process failed.
-                            log.error('[client] command failed: {}'.format(proc.args))
-                            log.error('[client] (errs={})'.format(errors))
+                            log.warning('Command failed: {}'.format(proc.args))
+                            log.warning('(errs={})'.format(errors))
                             # watcher.cancel()
 
                             # Check if sysbench is failed and do fast-fail if so:
                             if 'sysbench' in proc.args:  # sysbench failure is a critical error.
-                                log.error('[client] Fatal error found in sysbench, exiting...')
+                                log.error('Fatal error found in sysbench, exiting...')
 
                                 # Clean the running process list to quit the loop,
                                 # as all the processes have been killed in self.close()
-                                running_procs = []
                                 self._sweep_successful = False
-                                # raise RuntimeError
+                                _timeout = 0
                             else:  # Just ignore failures from the other commands
                                 #  self._running_procs.remove(proc)
                                 pass
                         else:
-                            log.info('[client] Done: (cmd={})'.format(proc.args))
-                            # self._running_procs.remove(proc) -->moved to above
+                            log.info('Done: (cmd={})'.format(proc.args))
+                            if 'sysbench' in proc.args:  # sysbench failure is a critical error.
+                                log.info('Sysbench is done after {} sec'.format(int(time.time() - start)))
+                                self._sweep_successful = True
+                                # To break out of the outer while loop
+                                _timeout = 0
 
                         # Break out from the inner loop after we found a finished process
                         # We'll not check the next process here, as we need to check the
@@ -329,7 +337,7 @@ class Sweep:
         for proc in running_procs:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                log.info('[client] Killed: ({}) {}.'.format(proc.pid, proc.args))
+                log.info('Killed: ({}) {}.'.format(proc.pid, proc.args))
                 self.all_running_procs.remove(proc)
             except (ProcessLookupError, BrokenPipeError, ValueError) as e:
                 print('Error in killing ({}) ({})'.format(proc.pid, e))
@@ -339,7 +347,7 @@ class Sweep:
         This function copies MySQL logs to sweep directory when sysbench is failed.
         :return:
         """
-        exit_status, hostname = self.run_db_cmd('hostname')
+        exit_status, hostname = self.run_db_cmd('hostname', suppress=True)
         hostname = hostname.rstrip('\n')
         for idx in range(1, self._db_num + 1):
             mysql_path = os.path.join(self._base_dir, 'mysql{idx}'.format(idx=idx))
@@ -351,20 +359,24 @@ class Sweep:
 
     def kill_running_procs(self):
         """
-        Kill all the running processes and cancel all the watchers.
+        Kill all the running processes. For now this function is only called
+        when the Sweep object is closing.
         :return:
         """
         procs = self.all_running_procs
         self.all_running_procs = []
 
         for proc in procs:
-            # log.debug('[client] Killing: ({}) {}.'.format(proc.pid, proc.args))
+            # log.debug('Killing: ({}) {}.'.format(proc.pid, proc.args))
             # proc.kill()  # This would not work for 'shell=True'
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                log.info('[client] Killed: ({}) {}.'.format(proc.pid, proc.args))
+                log.info('Killed: ({}) {}.'.format(proc.pid, proc.args))
             except (ProcessLookupError, BrokenPipeError):
                 print('Failed to kill process ({})'.format(proc.pid))
+
+        # Kill tdctl and monitor as these two commands won't exit by themselves.
+        self.run_db_cmd('killall tdctl monitor')
 
     def run_client_cmd(self, cmds, timeout):
         """
@@ -470,7 +482,7 @@ class Sweep:
         self.kill_proc_by_name(exec_file, self_pid)
 
         time.sleep(5)
-        log.info('[client] ***Client is ready.***')
+        log.info('***Client is ready.***')
 
     def run_one_test(self, thread_cnt):
         """
@@ -482,7 +494,9 @@ class Sweep:
         """
         assert thread_cnt is not None
 
-        log.info('Running test of {} sysbench threads'.format(thread_cnt))
+        log.info('******Running test of {} sysbench threads*****'.format(thread_cnt))
+        log.info('Go to {ip}:/tmp/{dir} for db-side logs.'.format(ip=self._db_ip,
+                                                                  dir=self._log_dir))
 
         # 0. list to store all commands and logs----------------------------
         curr_logs = []  # Record the file names of all current logs.
@@ -501,7 +515,7 @@ class Sweep:
                        '--num-threads={thread_num} ' \
                        '--max-requests=0  ' \
                        '--max-time={max_time} ' \
-                       '--report-interval=1 ' \
+                       '--report-interval={sysbench_poll_interval} ' \
                        '--oltp-read-only={oltp_read_only} ' \
                        '--oltp-point-selects={oltp_point_selects}  ' \
                        '--oltp-simple-ranges={oltp_simple_ranges} ' \
@@ -530,6 +544,7 @@ class Sweep:
                                          db_name=self._db_name,
                                          thread_num=thread_cnt,
                                          max_time=self._duration,
+                                         sysbench_poll_interval=self._sb_poll_interval,
                                          oltp_read_only='on' if self._read_only else 'off',
                                          oltp_point_selects=self._point_selects,
                                          oltp_simple_ranges=self._simple_ranges,
@@ -571,12 +586,12 @@ class Sweep:
             sys_log = os.path.join(self._log_dir, sys_log_name)
             count = '' if 'tdctl' in cmd else int(self._duration / 10)
             sys_cmd = 'ssh {user}@{ip} "{cmd} 10 {count} ' \
-                      '> /tmp/{log_name}"'.format(user=self._login_user,
-                                                  ip=self._db_ip,
-                                                  cmd=cmd,
-                                                  count=count,
-                                                  log_dir=self._log_dir,
-                                                  log_name=sys_log)
+                      '&> /tmp/{log_name}"'.format(user=self._login_user,
+                                                   ip=self._db_ip,
+                                                   cmd=cmd,
+                                                   count=count,
+                                                   log_dir=self._log_dir,
+                                                   log_name=sys_log)
             all_cmds.append(sys_cmd)
             curr_logs.append(sys_log)
 
@@ -587,14 +602,14 @@ class Sweep:
                                                            self._target, thread_cnt)
             client_log = os.path.join(self._log_dir, client_log_name)
             count = int(self._duration / 10)
-            full_client_cmd = '{cmd} 10 {count} > {log_name}'.format(cmd=cmd,
-                                                                     count=count,
-                                                                     log_name=client_log)
+            full_client_cmd = '{cmd} 10 {count} &> {log_name}'.format(cmd=cmd,
+                                                                      count=count,
+                                                                      log_name=client_log)
             all_cmds.append(full_client_cmd)
             curr_logs.append(client_log)
 
         # 5. The dmx monitoring logs: barf --fr - every 10 seconds------------------------------
-        barf_fr_log = os.path.join(self._log_dir, 'barf_fr.log')
+        barf_fr_log = os.path.join(self._log_dir, 'barffr_.log')
         barf_fr_cmd = "while true; " \
                       "do " \
                       "ssh {user}@{ip} 'barf --fr &>> /tmp/{log_name}'; " \
@@ -651,7 +666,20 @@ class Sweep:
             all_cmds.append(monitor_cmd)
             curr_logs.append(monitor_log)
 
-        # 9. Shoot the commands out------------------------------------------------------
+        # 9. The network traffic logs: sar, every 10 seconds------------------------------
+
+        sar_log = os.path.join(self._log_dir, 'network_traffic.log')
+        sar = "sar -n DEV 10 {cnt} " \
+              "|grep -E `ip addr show | grep {ip} | awk '{{print $NF}}'` " \
+              "&> {log_name}"
+        sar_cmd = sar.format(cnt=int(self._duration / 10),
+                             ip=self._client_ip,
+                             log_name=sar_log)
+
+        all_cmds.append(sar_cmd)
+        curr_logs.append(sar_log)
+
+        # 10. Shoot the commands out------------------------------------------------------
         # Allow 300 seconds more time to let the commands quit by themselves.
         self.run_client_cmd(all_cmds, self._duration + 180)
         self._sweep_logs.extend(curr_logs)
@@ -664,7 +692,7 @@ class Sweep:
         """
         log.info('Plotting the sweep')
         plot_files = ' '.join(self._sweep_logs)
-        plot_cmd = './sysbench_plot.py -p {} {}'.format(self._log_dir, plot_files)
+        plot_cmd = './plotter.py -p {} {}'.format(self._log_dir, plot_files)
 
         # The timeout of plot is 600 seconds, it will be killed if
         # not return before timeout
@@ -755,10 +783,10 @@ class Sweep:
         """Inner function to get database config from a specific command
         """
         save_to = os.path.join(self._log_dir, save_to)
-        exit_status, result = self.run_db_cmd(cmd)
+        exit_status, result = self.run_db_cmd(cmd, suppress=True)
 
         if exit_status != 0:
-            pass  # TODO: it should return from here.
+            pass  # TODO: it should return here.
 
         try:
             with open(save_to, 'a') as out_file:
@@ -773,7 +801,7 @@ class Sweep:
         """
         cmd = "grep pid-file /etc/my.cnf | awk -F= '{{print $NF}}' " \
               "| head -{} | xargs cat".format(self._db_num)
-        exit_status, pids = self.run_db_cmd(cmd)
+        exit_status, pids = self.run_db_cmd(cmd, suppress=True)
         return pids.split('\n')
 
     def start(self):
@@ -813,14 +841,19 @@ class Sweep:
         self.copy_db_file(staging_logs, './')
 
         if self._target == 'DMX':
+            log.info('Copying mysqld config file under bfapp.d and bfcs.d')
             self.copy_db_file('/dmx/etc/bfapp.d/mysqld', 'bfappd.mysqld')
             self.copy_db_file('/dmx/etc/bfcs.d/mysqld', 'bfcsd.mysqld')
 
         # Get the database server configurations and write to a log file
+        log.info('Fetching database h/w and driver information. ')
         self.get_db_cnf_by_cmd('barf --dv', 'barf.out')
         self.get_db_cnf_by_cmd('barf -v -l', 'barf.out')
-        self.get_db_cnf_by_cmd('lscpu', 'server_os_info.out')
         self.get_db_cnf_by_cmd('free', 'server_os_info.out')
+
+        lscpu = "lscpu | grep -Ev 'Architecture|Order|cache|[F|f]amily|Vendor" \
+                "|Stepping|op-mode|Model:|node[0-9]|MIPS'"
+        self.get_db_cnf_by_cmd(lscpu, 'server_os_info.out')
 
         # Plot the logs after sweep.
         if self._plot and self._sweep_successful:
@@ -901,7 +934,6 @@ if __name__ == "__main__":
         except SweepFatalError:
             status = 'failed'
             print('Fatal error. See above error messages.')
-            # sweep.close()
 
     log.info('The sweep is {}. Bye.'.format(status))
     sys.exit(0)
