@@ -15,6 +15,9 @@ import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
+redo_log_file_size = 0
+buffer_pool_size = 0
+
 
 def parse_log(log_file, log_type):
     """
@@ -45,21 +48,19 @@ def parse_log(log_file, log_type):
                           r'(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)',
                 'tdctl': r'^[\d.]+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)[\s-]+(\w*)',
                 'barffr': r'^\s*TOTAL:\s+(\d+)%\s+(\d+)\s+(\d+)\s*$',
-                'network': r'^\S+\s+PM\s+(\S+)\s+\S+\s+\S+\s+(\S+)\s+(\S+)\s+'
+                'network': r'^\S+\s+[AP]M\s+(\S+)\s+\S+\s+\S+\s+(\S+)\s+(\S+)\s+'
                 }
     ptn = ptn_list.get(log_type)
     if ptn:  # Parsed with re
         ptn = re.compile(ptn)
-        try:
-            with open(log_file) as log:
-                for line in log:
-                    match = ptn.findall(line)
-                    if len(match) > 0:
-                        # print(match[0])
-                        yield match[0]
-        except FileNotFoundError as e:
-            print(e)
-            return
+        # Catch the FileNotFoundError outside of this function
+        with open(log_file) as log:
+            for line in log:
+                match = ptn.findall(line)
+                if len(match) > 0:
+                    # print(match[0])
+                    yield match[0]
+
     else:  # Parsed by customized functions
         if log_type == 'innodb':
             yield from parse_innodb_status(log_file)
@@ -81,6 +82,7 @@ def parse_innodb_status(log_file):
     checkpoint_lsn = 0
     dirty_pages = 0
 
+    # Catch the FileNotFoundError outside of this function
     with open(log_file) as file:
         for line in file:
             if line.startswith('Log sequence number'):
@@ -148,27 +150,27 @@ def plot_sar(data, plotfile, prefix):
         inet_name, rxkb_s, txkb_s = list(zip(*data))
     except ValueError as e:
         print(e)
-        raise
+        return
     rxmb_s = [float(x)/1024 for x in rxkb_s]
     txmb_s = [float(x)/1024 for x in txkb_s]
     sec = [10*x for x in range(len(rxmb_s))]
     sec_max = sec[-1]
 
-    y_max = int(max(max(rxmb_s), max(txmb_s)))
+    y_max = float(max(max(rxmb_s), max(txmb_s)))
 
     matplotlib.rcParams.update({'font.size': 10})
-
+    plt.figure(figsize=(8, 6))
     plt.subplot(111)
     plt.plot(sec, rxmb_s, label='Received MB/s')
     plt.plot(sec, txmb_s, label='Transmitted MB/s')
     _, name_with_ext = os.path.split(plotfile)
     title_desc, _ = os.path.splitext(name_with_ext)
 
-    plt.title('Network Traffic: {} ({}/{})'.format(inet_name[0], prefix, title_desc),
+    plt.title('Network Traffic: {} \n({}/{})'.format(inet_name[0], prefix, title_desc),
               fontsize=10, fontweight='bold')
     plt.ylabel('MB/s')
     plt.xlim([0, sec_max])
-    plt.ylim([0, y_max*1.5])
+    plt.ylim([0, round(y_max*1.5, 3)])
     plt.legend(fontsize=8, loc='best')
     plt.grid(True)
 
@@ -182,22 +184,22 @@ def plot_barf_fr(data, plotfile, prefix):
     This function plots the log of command: barf --fr
     :param data:
     :param plotfile:
-    :param pre:
+    :param prefix:
     :return:
     """
     try:
         pct, free, used = list(zip(*data))
     except ValueError as e:
         print(e)
-        raise
+        return
 
-    sec = [10*x for x in range(len(free))]
+    sec = [30*x for x in range(len(free))]
     sec_max = sec[-1]
 
     mb_max = int(max(free)) + int(min(used))
 
     matplotlib.rcParams.update({'font.size': 10})
-
+    plt.figure(figsize=(8, 6))
     plt.subplot(211)
     plt.plot(sec, free, label='Free MB')
     plt.plot(sec, used, label='Used MB')
@@ -235,39 +237,52 @@ def plot_innodb(data, plotfile, prefix):
     :return:
     """
     # The data is (log_flush_lag, page_flush_lag, checkpoint_lag, dirty_pages)
+    if redo_log_file_size == 0 or buffer_pool_size == 0:
+        print('Warning: Invalid redo_log_file_size/buffer_pool_size, skipping innodb log.')
+        return
+
     try:
         log_flush_lag, page_flush_lag, checkpoint_lag, dirty_pages = list(zip(*data))
     except ValueError as e:
         print(e)
-        raise
+        return
+
+    log_flush_lag = [(int(x)*100/redo_log_file_size) for x in log_flush_lag]
+    page_flush_lag = [(int(x)*100/redo_log_file_size) for x in page_flush_lag]
+    checkpoint_lag = [(int(x)*100/redo_log_file_size) for x in checkpoint_lag]
+    dirty_pages = [int(x)*16*1024*100/buffer_pool_size for x in dirty_pages]
 
     sec = [60*x for x in range(len(log_flush_lag))]
     sec_max = sec[-1]
 
-    lag_max = max(log_flush_lag, page_flush_lag, checkpoint_lag)
-    dirty_pages_max = max(dirty_pages)
+    # lag_max = max(log_flush_lag, page_flush_lag, checkpoint_lag)
+    lsn_lag_max = 100
+    # dirty_pages_max = max(dirty_pages)
+    dirty_pages_max = 100
 
     matplotlib.rcParams.update({'font.size': 10})
 
     plt.subplot(211)
     plt.plot(sec, log_flush_lag, label='Log flush lag')
-    plt.plot(sec, page_flush_lag, label='Dirty page flush lag')
+    plt.plot(sec, page_flush_lag, label='DirtyPagesFlush lag')
     plt.plot(sec, checkpoint_lag, label='Checkpoint lag')
     _, name_with_ext = os.path.split(plotfile)
     title_desc, _ = os.path.splitext(name_with_ext)
 
-    plt.title('LSN lag({}/{})'.format(prefix, title_desc),
-              fontsize=10, fontweight='bold')
-    plt.ylabel('LSN lag')
+    plt.title('Log lag, RedoLog={}GB ({}/{})'.format(redo_log_file_size/(1024**3), prefix, title_desc),
+              fontsize=9, fontweight='bold')
+    plt.ylabel('Log lag (%)')
     plt.xlim([0, sec_max])
+    plt.ylim([0, lsn_lag_max])
     plt.legend(fontsize=8, loc='best')
     plt.grid(True)
 
     plt.subplot(212)
     plt.plot(sec, dirty_pages, label='Dirty pages')
-    plt.title('Buffer pool dirty pages', fontsize=10, fontweight='bold')
+    plt.title('Buffer pool dirty pages % (BufferPool={}GB)'.format(buffer_pool_size/(1024**3)),
+              fontsize=9, fontweight='bold')
     plt.xlim([0, sec_max])
-    plt.ylabel('pages')
+    plt.ylabel('pages %')
     plt.ylim([0, dirty_pages_max])
     plt.legend(fontsize=8, loc='best')
     plt.grid(True)
@@ -292,8 +307,8 @@ def plot_tdctl(data, plotfile, prefix):
     1466515297.647           0      0.00      0.00          0.000        0        0
     """
     assert data is not None
-    matplotlib.rcParams.update({'font.size': 60})
-    plt.figure(figsize=(100, 60))
+    matplotlib.rcParams.update({'font.size': 10})
+    plt.figure(figsize=(15, 10))
 
     tdctl_data = defaultdict(list)
     for *value, device in data:
@@ -306,46 +321,47 @@ def plot_tdctl(data, plotfile, prefix):
     for key in tdctl_data.keys():
         tdctl_data[key] = list(zip(*tdctl_data[key]))
 
-    sec = range(0, len(tdctl_data['total'][0]) * 10, 10)
+    ylen = len(tdctl_data['total'][0])
+    sec = range(0, ylen * 10, 10)
     title = '{}_tdctl'.format(prefix)
 
     # Plot IOPS
     plt.subplot(2, 2, 1)
     for key in tdctl_data.keys():
-        plt.plot(sec, tdctl_data[key][0], label=key)
+        plt.plot(sec, tdctl_data[key][0][0:ylen], label=key)
 
     plt.xlabel('seconds')
     plt.ylabel('IOPS')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=30)
+    plt.legend(fontsize=10)
     plt.title('IOPS', fontweight='bold')
 
     # Plot Read MBPS
     plt.subplot(2, 2, 2)
     for key in tdctl_data.keys():
-        plt.plot(sec, tdctl_data[key][1], label=key)
+        plt.plot(sec, tdctl_data[key][1][0:ylen], label=key)
 
     plt.xlabel('seconds')
     plt.ylabel('MB/s')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=30)
+    plt.legend(fontsize=10)
     plt.title('Read MB/s', fontweight='bold')
 
     # Plot Write MBPS
     plt.subplot(2, 2, 3)
     for key in tdctl_data.keys():
-        plt.plot(sec, tdctl_data[key][2], label=key)
+        plt.plot(sec, tdctl_data[key][2][0:ylen], label=key)
 
     plt.xlabel('seconds')
     plt.ylabel('MB/s')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=30)
+    plt.legend(fontsize=10)
     plt.title('Write MB/s', fontweight='bold')
 
     # Plot Latency
     plt.subplot(2, 2, 4)
     for key in tdctl_data.keys():
-        plt.plot(sec, tdctl_data[key][3], label=key)
+        plt.plot(sec, tdctl_data[key][3][0:ylen], label=key)
 
     plt.xlabel('seconds')
     plt.ylabel('latency(us)')
@@ -354,13 +370,14 @@ def plot_tdctl(data, plotfile, prefix):
     max_lat = max(flat_lat)
     lat_ylim = np.percentile(np.array(flat_lat), 99)
     plt.ylim([0, lat_ylim])
-    plt.legend(fontsize=30)
-    plt.title('Latency, max={}us'.format(max_lat), fontsize=60, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.title('Latency, max={}us'.format(max_lat), fontsize=10, fontweight='bold')
 
     fig = plt.gcf()
-    fig.suptitle(title, fontsize=120, fontweight='bold')
+    fig.suptitle(title, fontsize=10, fontweight='bold', y=0.99)
     plt.grid(True)
 
+    plt.tight_layout()
     plt.savefig(plotfile)
     plt.close()
 
@@ -374,8 +391,8 @@ def plot_tdctl(data, plotfile, prefix):
         plt.figure(figsize=(10, 6))
         plt.subplot(1, 1, 1)
         for key in tdctl_data.keys():
-            plt.plot(sec, tdctl_data[key][4], label=key+'_Warn')
-            plt.plot(sec, tdctl_data[key][5], label=key+'_Err')
+            plt.plot(sec, tdctl_data[key][4][0:ylen], label=key+'_Warn')
+            plt.plot(sec, tdctl_data[key][5][0:ylen], label=key+'_Err')
 
         plt.xlabel('seconds')
         plt.ylabel('count')
@@ -389,13 +406,14 @@ def plot_tdctl(data, plotfile, prefix):
         head, tail = os.path.split(plotfile)
         tail = 'errs_' + tail
         err_plotfile = os.path.join(head, tail)
+
         plt.savefig(err_plotfile)
         plt.close()
 
 
 def plot_vmstat(data, plotfile, prefix):
-    matplotlib.rcParams.update({'font.size': 60})
-    plt.figure(figsize=(100, 60))
+    matplotlib.rcParams.update({'font.size': 10})
+    plt.figure(figsize=(15, 10))
     vmstat_data = list(zip(*data))
 
     if not vmstat_data:
@@ -418,8 +436,8 @@ def plot_vmstat(data, plotfile, prefix):
     plt.plot(sec, vmstat_data[1], label='b')
     plt.xlabel('seconds')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('procs', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.title('procs', fontsize=10, fontweight='bold')
 
     plt.subplot(3, 2, 2)
     plt.plot(sec, vmstat_data[2], label='swpd')
@@ -428,32 +446,32 @@ def plot_vmstat(data, plotfile, prefix):
     plt.plot(sec, vmstat_data[5], label='cache')
     plt.xlabel('seconds')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('memory', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.title('memory', fontsize=10, fontweight='bold')
 
     plt.subplot(3, 2, 3)
     plt.plot(sec, vmstat_data[6], label='si')
     plt.plot(sec, vmstat_data[7], label='so')
     plt.xlabel('seconds')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('swap', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.title('swap', fontsize=10, fontweight='bold')
 
     plt.subplot(3, 2, 4)
     plt.plot(sec, vmstat_data[8], label='bi')
     plt.plot(sec, vmstat_data[9], label='bo')
     plt.xlabel('seconds')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('io', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.title('io', fontsize=10, fontweight='bold')
 
     plt.subplot(3, 2, 5)
     plt.plot(sec, vmstat_data[10], label='in')
     plt.plot(sec, vmstat_data[11], label='cs')
     plt.xlabel('seconds')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('system', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.title('system', fontsize=10, fontweight='bold')
 
     plt.subplot(3, 2, 6)
     plt.plot(sec, vmstat_data[12], label='us')
@@ -463,13 +481,14 @@ def plot_vmstat(data, plotfile, prefix):
     plt.plot(sec, vmstat_data[16], label='st')
     plt.xlabel('seconds')
     plt.xlim([0, sec[-1]])
-    plt.legend(fontsize=60)
-    plt.title('cpu', fontsize=60, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.title('cpu', fontsize=10, fontweight='bold')
 
     fig = plt.gcf()
-    fig.suptitle(title, fontsize=120, fontweight='bold')
+    fig.suptitle(title, fontsize=10, fontweight='bold', y=0.99)
     plt.grid(True)
 
+    plt.tight_layout()
     plt.savefig(plotfile)
     plt.close()
 
@@ -518,9 +537,9 @@ def plot_iostat(data, plotfile, prefix=''):
     :return:
     """
     assert data is not None
-    matplotlib.rcParams.update({'font.size': 60})
+    matplotlib.rcParams.update({'font.size': 10})
     # matplotlib.rcParams['figure.figsize'] = 40, 60
-    plt.figure(figsize=(100, 60))
+    plt.figure(figsize=(15, 10))
     title = '{}_iostat'.format(prefix)
 
     try:
@@ -544,8 +563,9 @@ def plot_iostat(data, plotfile, prefix=''):
         plt.grid(True)
 
     fig = plt.gcf()
-    fig.suptitle(title, fontsize=120, fontweight='bold')
+    fig.suptitle(title, fontsize=10, fontweight='bold', y=0.99)
 
+    plt.tight_layout()
     plt.savefig(plotfile)
     plt.close()
 
@@ -584,7 +604,7 @@ def plot_sb(data, plotfile, prefix):
     _, name_with_ext = os.path.split(plotfile)
     title_desc, _ = os.path.splitext(name_with_ext)
 
-    plt.title('TPS({}/{}) (max={}, avg={:.2f})'.format(prefix, title_desc, tps_max, tps_avg),
+    plt.title('TPS({}/{}) \n (max={}, avg={:.2f})'.format(prefix, title_desc, tps_max, tps_avg),
               fontsize=10, fontweight='bold')
     plt.ylabel('tps')
     plt.xlim([0, sec_max])
@@ -612,16 +632,24 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="The Utility to plot your sysbench logs.")
     parser.add_argument("-p", help="the prefix of the title of the graphs", default='')
     parser.add_argument("files", nargs='*', help="the files to plot")
+    parser.add_argument("-r", help="redo log file total size in bytes", type=int, default=0)
+    parser.add_argument("-b", help="buffer pool size in bytes", type=int, default=0)
 
     args = parser.parse_args()
 
     logfile_names = args.files
     title_prefix = args.p
+    redo_log_file_size = args.r
+    buffer_pool_size = args.b
 
     for file_name in logfile_names:
-        # [Hard-coded]the first part of the log file name is the type
-        plot_type = os.path.basename(file_name).split('_')[0]
-        log_data = parse_log(file_name, plot_type)
-        plot_file = file_name.split('.')[0] + '.png'
+        try:
+            # [Hard-coded]the first part of the log file name is the type
+            plot_type = os.path.basename(file_name).split('_')[0]
+            # parse_log may throw FileNotFoundError
+            log_data = parse_log(file_name, plot_type)
+            plot_file = file_name.split('.')[0] + '.png'
 
-        plot(plot_type, log_data, plot_file, title_prefix)
+            plot(plot_type, log_data, plot_file, title_prefix)
+        except (FileNotFoundError, ValueError) as e:
+            print(e)
