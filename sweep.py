@@ -2,28 +2,6 @@
 """ This sweep program is used to run MySQL benchmarks with various configurations
     in client/server. Run this command on the client.
     External dependencies: plotter.py, cleandb.py
-    
-    History:
-    0. Initial version created.               -- @EricYang v0.1 March xx, 2016
-    ...
-
-    1. Removed 'sweep_name' from config file. -- @EricYang v0.6 Aug 11, 2016
-    2. Changed threading.Timer handler        -- @EricYang v0.61 Aug 20, 2016
-    3. Changes:
-           Added 'tarball_path' as a new config option
-           Log directory of a failed benchmark will be renamed to 'failed_blabla'
-           Added logs for commands: lscpu, free, etc
-                                              --@EricYang v0.62 Aug 24, 2016
-    4. Added 'mysql_base_dir' to the .cnf file --@EricYang v0.63 Aug 27, 2016
-    5. Added logs of show engine innodb status --@EricYang v0.64 Sep 01, 2016
-    6. Fixed a few bugs.
-       Added 'tar_strips_components' to the .cnf file --@EricYang v0.65 Sep 03, 2016
-    7. A few enhancements and bug fixes.       --@EricYang v0.65 Sep 09, 2016
-    8. Fixed a major bug: the _run_local() should be reentrant.  --@EricYang v0.66 Sep10, 2016
-    9. Used time comparison instead of the timer in _run_local()
-       Fixed a bug of the code using epoll                      --@EricYang v0.67 Sep12, 2016
-    10. Now sweep can send the redo/buffer size to plotter to get the percentages of lags.
-                                                                --@EricYang v0.68 Sep13, 2016
 """
 import os
 import time
